@@ -17,7 +17,14 @@ from typing import Any
 
 from vllm_torchtpu import envs as tpu_envs
 
-from .pool_manifest import TAG_FA, TAG_GDN_CONV, TAG_GDN_SSM, TAG_MLA_NOPE, PoolManifest
+from .pool_manifest import (
+    TAG_DSA_IDX,
+    TAG_FA,
+    TAG_GDN_CONV,
+    TAG_GDN_SSM,
+    TAG_MLA_NOPE,
+    PoolManifest,
+)
 from .tags import class_tag
 
 
@@ -261,11 +268,17 @@ def measured_glm_layout_fingerprint(
     page_tokens: int,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
+    hash_indexer: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Fingerprint of the admitted GLM cache layout, compared across peers.
 
     Hash per-page geometry only: both peers must agree on it, but they size
     their pools independently.
+
+    ``hash_indexer=False`` leaves the indexer class out of the hash (every
+    pool is still validated): a pipeline stage whose layers reuse an earlier
+    layer's top-k holds no indexer cache, yet must fingerprint identically to
+    a destination holding every layer.
     """
     layouts = _measure_packed_row_layouts(
         manifest,
@@ -273,6 +286,8 @@ def measured_glm_layout_fingerprint(
         layout_getter=layout_getter,
         include_page_shape=True,
     )
+    if not hash_indexer:
+        layouts.pop(TAG_DSA_IDX, None)
     version = package_version or importlib.metadata.version
     payload = {
         "schema": GLM_MLA_LAYOUT_FINGERPRINT_SCHEMA,

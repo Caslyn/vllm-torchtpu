@@ -343,3 +343,32 @@ def test_dsv4_fingerprint_is_stable_across_pool_capacity():
         package_version=_glm_versions,
     )
     assert small == large
+
+
+def test_glm_stage_without_indexer_fingerprints_like_every_layer():
+    # A pipeline stage holding only layer 1 has no indexer cache; with the
+    # indexer class left out of the hash it matches a peer holding all.
+    full = glm_named_kv_caches()
+    layer = "model.layers.1.self_attn.mla_attn"
+    stage = {layer: full[layer]}
+
+    def fingerprint(named, **kwargs):
+        manifest = rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=1024,
+            per_layer_tags=True,
+        )
+        return rlf.measured_glm_layout_fingerprint(
+            manifest,
+            page_tokens=1024,
+            layout_getter=_glm_layout_getter,
+            package_version=_glm_versions,
+            **kwargs,
+        )
+
+    stage_fp, stage_payload = fingerprint(stage, hash_indexer=False)
+    full_fp, full_payload = fingerprint(full, hash_indexer=False)
+    assert stage_fp == full_fp
+    assert set(full_payload["layouts"]) == {"mla.nope", "mla.rope"}
+    assert fingerprint(full)[0] != full_fp

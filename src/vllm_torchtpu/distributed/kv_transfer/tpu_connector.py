@@ -673,8 +673,8 @@ def _is_kimi(vllm_config: VllmConfig) -> bool:
 
 
 def _uses_tp_stage3_source(vllm_config: VllmConfig) -> bool:
-    """Whether producer cache ownership follows TP ranks rather than PCP."""
-    return _use_raiden_glm_admission() or (
+    """Whether the producer's TP ranks are transfer ranks."""
+    return (_use_raiden_glm_admission() and not _engine_is_pipeline(vllm_config)) or (
         bool(tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER)
         and bool(tpu_envs.TPU_RAIDEN_KIMIK3_ADMISSION)
         and _is_kimi(vllm_config)
@@ -2780,6 +2780,7 @@ class TPURaidenConnectorWorker:
             named_kv_caches=named_kv_caches,
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
+            per_layer_tags=_use_per_layer_pool_tags(),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3057,7 +3058,13 @@ class TPURaidenConnectorWorker:
             measured_glm_layout_fingerprint,
         )
 
-        return measured_glm_layout_fingerprint(manifest, page_tokens=page_tokens)
+        # Pipeline stage may hold no indexer layer, so the indexer class stays out of
+        # the fingerprint on both sides.
+        return measured_glm_layout_fingerprint(
+            manifest,
+            page_tokens=page_tokens,
+            hash_indexer=not _use_per_layer_pool_tags(),
+        )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
@@ -3623,7 +3630,9 @@ class TPURaidenConnectorWorker:
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
                     self._register_stage3_request_blocks_dsv4(metadata)
-                elif _uses_tp_stage3_source(self.vllm_config):
+                elif _use_raiden_glm_admission() or _uses_tp_stage3_source(
+                    self.vllm_config
+                ):
                     self._register_stage3_request_row_spans(metadata)
                 else:
                     self._register_stage3_request_blocks(metadata)
@@ -4001,10 +4010,19 @@ class TPURaidenConnectorWorker:
         for tag in _STAGE3_GLM_TRANSFER_POOL_TAGS:
             geo = geometry.get(tag)
             if not geo:
+                # Pipeline stage whose layers all reuse an earlier layer's top-k
+                # holds no indexer cache.
+                if tag == "dsa.idx" and _use_per_layer_pool_tags():
+                    continue
                 raise RuntimeError(f"Stage-3 GLM manifest is missing tag {tag!r}")
-            pool = next(p for p in manifest.pools if p.tag == tag)
-            (region,) = pool.regions
-            result[tag] = (int(geo["live_bytes_per_block"]), int(region.unit_bytes))
+            # One entry per exact pool tag: the class tag, or one per layer
+            # under per-layer tags.
+            for pool in manifest.pools_of_class(tag):
+                (region,) = pool.regions
+                result.setdefault(
+                    pool.tag,
+                    (int(geo["live_bytes_per_block"]), int(region.unit_bytes)),
+                )
         return result
 
     def _register_stage3_request_row_spans(
@@ -4039,6 +4057,11 @@ class TPURaidenConnectorWorker:
 
         tag_geometry = self._stage3_row_geometry
         page_tokens = int(self.vllm_config.cache_config.block_size)
+        # A pipeline stage holds every token of its own layers: it owns every
+        # page, and per-layer pool tags express its layer subset.
+        pipeline = _engine_is_pipeline(self.vllm_config)
+        lowering_parallelism = 1 if pipeline else parallelism
+        lowering_rank = 0 if pipeline else transfer_rank
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
@@ -4052,15 +4075,13 @@ class TPURaidenConnectorWorker:
             scheduler_ids = tuple(
                 int(block_id) for block_id in req_meta.local_block_ids
             )
-            transfer_tags = (
-                ("fa",) if self._stage3_kimi else _STAGE3_GLM_TRANSFER_POOL_TAGS
-            )
+            transfer_tags = ("fa",) if self._stage3_kimi else list(tag_geometry)
             pool_spans = [
                 lower_glm_row_spans(
                     tag=tag,
                     num_tokens=num_tokens,
-                    transfer_rank=transfer_rank,
-                    parallelism=parallelism,
+                    transfer_rank=lowering_rank,
+                    parallelism=lowering_parallelism,
                     page_tokens=page_tokens,
                     live_bytes_per_block=tag_geometry[tag][0],
                     row_bytes=tag_geometry[tag][1],
@@ -5176,7 +5197,7 @@ class TPURaidenConnectorWorker:
                     dst_counts.append(len(pages))
             else:
                 if _use_raiden_glm_admission():
-                    transfer_tags = list(_STAGE3_GLM_TRANSFER_POOL_TAGS)
+                    transfer_tags = list(self._stage3_row_geometry)
                 else:
                     transfer_tags = self._stage3_fa_registration_tags()
                 dst_blocks = list(local_blocks) * len(transfer_tags)
@@ -5684,7 +5705,7 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             transfer_tags = (
-                list(_STAGE3_GLM_TRANSFER_POOL_TAGS)
+                list(self._stage3_row_geometry)
                 if _use_raiden_glm_admission()
                 else self._stage3_fa_registration_tags()
             )

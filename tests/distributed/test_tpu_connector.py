@@ -6187,3 +6187,111 @@ def test_stage3_layout_measures_the_block_major_pool():
 
     measure.assert_called_once_with(manifest, block_major=True)
     assert result == ("fingerprint", payload, 256)
+
+
+class TestGlmPipelineParallelProducer:
+    """GLM-5.2 pipeline prefill (PP x TP1) as a Stage-3 source: each stage
+    registers every page of its own layers under per-layer pool tags."""
+
+    @staticmethod
+    def _stage_manifest(layers, per_layer_tags=True):
+        from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
+
+        from .raiden_test_utils import glm_named_kv_caches
+
+        full = glm_named_kv_caches()
+        named = {
+            name: cache
+            for name, cache in full.items()
+            if rpm.layer_index_from_name(name) in layers
+        }
+        return rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=1024,
+            per_layer_tags=per_layer_tags,
+        )
+
+    @staticmethod
+    def _glm_env(per_layer_tags=True):
+        return (
+            patch(f"{_MOD}.tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER", True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION", True),
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden"),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+                per_layer_tags,
+                create=True,
+            ),
+        )
+
+    def test_stage_without_indexer_measures_its_own_tags(self):
+        with self._glm_env()[4]:
+            geometry = TPURaidenConnectorWorker._measure_glm_tag_geometry(
+                self._stage_manifest({1})
+            )
+            assert list(geometry) == ["mla.nope.l1", "mla.rope.l1"]
+            geometry = TPURaidenConnectorWorker._measure_glm_tag_geometry(
+                self._stage_manifest({0, 1})
+            )
+            assert list(geometry) == [
+                "mla.nope.l0",
+                "mla.nope.l1",
+                "mla.rope.l0",
+                "mla.rope.l1",
+                "dsa.idx.l0",
+            ]
+        with (
+            self._glm_env(per_layer_tags=False)[4],
+            pytest.raises(RuntimeError, match="missing tag 'dsa.idx'"),
+        ):
+            TPURaidenConnectorWorker._measure_glm_tag_geometry(
+                self._stage_manifest({1}, per_layer_tags=False)
+            )
+
+    def test_pipeline_checks_and_completion_count(self):
+        cfg = _make_vllm_config(is_producer=True, pp_size=8, tp_size=1)
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8)
+        env = self._glm_env()
+        with env[0], env[1], env[2], env[3], env[4]:
+            scheduler = TPURaidenConnectorScheduler(cfg)
+            assert scheduler.get_finished_count() == 8
+            worker._validate_stage3_transfer_parallelism(8)
+            with pytest.raises(ValueError, match="PP stage count"):
+                worker._validate_stage3_transfer_parallelism(1)
+
+    def test_stage_registers_every_page_of_its_layers(self):
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, pp_size=8, block_size=1024)
+        env = self._glm_env()
+        with env[4]:
+            worker._stage3_row_geometry = worker._measure_glm_tag_geometry(
+                self._stage_manifest({1})
+            )
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        worker._raiden_controller_facade = facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_address = "prefill.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(rank=5)
+        metadata = TPUConnectorMetadata()
+        metadata.reqs_to_send["req"] = SimpleNamespace(
+            uuid=7,
+            local_block_ids=[10, 11, 12],
+            num_tokens=2500,
+            expiration_time=1e20,
+        )
+        group = SimpleNamespace(rank_in_group=5)
+        with (
+            env[0],
+            env[1],
+            env[2],
+            env[3],
+            env[4],
+            patch("vllm.distributed.parallel_state.get_pp_group", return_value=group),
+        ):
+            worker.process_send_load(metadata)
+
+        (call,) = facade.register_request_blocks_calls
+        spans = call["pool_spans"]
+        assert [reg.tag for reg in spans] == ["mla.nope.l1", "mla.rope.l1"]
+        assert all(len(reg.spans) == 3 for reg in spans)
+        assert call["block_ids"] == [10, 11, 12]
