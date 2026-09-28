@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     TPU_MULTIHOST_BACKEND: str = ""
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     PYTHON_TRACER_LEVEL: int = 1
+    HOST_TRACER_LEVEL: int = 2
+    DEVICE_TRACER_LEVEL: int = 1
+    TPU_TRACE_MODE: str = "TRACE_COMPUTE"
+    TPU_NUM_SPARSE_CORES_TO_TRACE: int = 1
+    TPU_NUM_SPARSE_CORE_TILES_TO_TRACE: int = 1
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
@@ -387,6 +392,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Python tracer level for profiling
     "PYTHON_TRACER_LEVEL": lambda: int(os.getenv("PYTHON_TRACER_LEVEL") or "1"),
+    # Host tracer level for profiling
+    "HOST_TRACER_LEVEL": lambda: int(os.getenv("HOST_TRACER_LEVEL") or "2"),
+    # Device tracer level for profiling
+    "DEVICE_TRACER_LEVEL": lambda: int(os.getenv("DEVICE_TRACER_LEVEL") or "1"),
+    # TPU trace mode (e.g. TRACE_COMPUTE, TRACE_COMPUTE_AND_SYNC)
+    "TPU_TRACE_MODE": lambda: os.getenv("TPU_TRACE_MODE", "TRACE_COMPUTE"),
+    # Number of sparse cores to trace
+    "TPU_NUM_SPARSE_CORES_TO_TRACE": lambda: int(
+        os.getenv("TPU_NUM_SPARSE_CORES_TO_TRACE") or "1"
+    ),
+    # Number of sparse core tiles to trace
+    "TPU_NUM_SPARSE_CORE_TILES_TO_TRACE": lambda: int(
+        os.getenv("TPU_NUM_SPARSE_CORE_TILES_TO_TRACE") or "1"
+    ),
     # Enable/disable Ray usage statistics collection
     "RAY_USAGE_STATS_ENABLED": lambda: os.getenv("RAY_USAGE_STATS_ENABLED", "0"),
     # Ray compiled DAG channel type for TPU
