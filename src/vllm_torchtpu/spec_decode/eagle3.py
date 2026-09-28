@@ -1763,8 +1763,7 @@ class Eagle3Proposer:
                     torch.zeros(
                         (num_tokens, aux_w),
                         dtype=runner._hidden_states_dtype,
-                        device=runner.device,
-                    )
+                    ).to(runner.device)
                     for _ in range(3)
                 ]
                 out = self._draft_combine_hidden_states(*aux)
@@ -1791,9 +1790,9 @@ class Eagle3Proposer:
                 for p in idx_sizes:
                     if p > T:
                         continue
-                    ids = torch.zeros(T, dtype=torch.int32, device=runner.device)
-                    lti = torch.zeros(p, dtype=torch.int64, device=runner.device)
-                    nti = torch.zeros(p, dtype=torch.int32, device=runner.device)
+                    ids = torch.zeros(T, dtype=torch.int32).to(runner.device)
+                    lti = torch.zeros(p, dtype=torch.int64).to(runner.device)
+                    nti = torch.zeros(p, dtype=torch.int32).to(runner.device)
                     out = self._draft_seed_input_ids(ids, lti, nti)
                     synchronize_tensors(out)
 
@@ -1824,8 +1823,7 @@ class Eagle3Proposer:
                 dummy_hidden = torch.zeros(
                     (n, hidden_size),
                     dtype=runner._hidden_states_dtype,
-                    device=runner.device,
-                )
+                ).to(runner.device)
                 out = self._draft_propose_token(dummy_hidden)
                 synchronize_tensors(out)
                 logger.info("  -- drafter compute_logits n: %d", n)

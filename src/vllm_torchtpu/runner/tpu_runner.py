@@ -4964,9 +4964,8 @@ class TPUModelRunner(GPUModelRunner):
     def _dummy_logits(self, num_reqs: int) -> torch.Tensor:
         return torch.zeros(
             (num_reqs, self.vocab_size),
-            device=self.device,
             dtype=self._hidden_states_dtype,
-        )
+        ).to(self.device)
 
     def _precompile_compute_selected_logits(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -4974,13 +4973,10 @@ class TPUModelRunner(GPUModelRunner):
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
-                )
+                ).to(self.device)
                 for num_reqs in self.num_reqs_paddings:
-                    indices = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
-                    )
+                    indices = torch.zeros(num_reqs, dtype=torch.int32).to(self.device)
                     out = self.compute_selected_logits(dummy_hidden, indices)
                     synchronize_tensors(out)
                     logger.info(
@@ -4995,9 +4991,8 @@ class TPUModelRunner(GPUModelRunner):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
-                )
+                ).to(self.device)
                 out = self.compute_logits_from_hidden_states(dummy_hidden)
                 synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -5049,14 +5044,14 @@ class TPUModelRunner(GPUModelRunner):
             for num_reqs in self.num_reqs_paddings:
                 dummy_logits = self._dummy_logits(num_reqs)
                 dummy_temperatures = torch.ones(
-                    (num_reqs, 1), dtype=self._hidden_states_dtype, device=self.device
-                )
+                    (num_reqs, 1), dtype=self._hidden_states_dtype
+                ).to(self.device)
                 dummy_u = torch.rand_like(dummy_logits)
-                dummy_top_k = torch.zeros(
-                    (num_reqs, 1), dtype=torch.int32, device=self.device
+                dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
+                    self.device
                 )
-                dummy_top_p = torch.ones(
-                    (num_reqs, 1), dtype=torch.float32, device=self.device
+                dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
+                    self.device
                 )
                 for all_greedy in [False, True]:
                     out = self.sample_from_logits_func(
@@ -5094,21 +5089,17 @@ class TPUModelRunner(GPUModelRunner):
             )
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
-                input_ids = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
-                )
-                cur_input_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
                 # -1 sentinel marks every slot as padding so the precompiled
                 # program is byte-identical to the runtime JIT call.
                 pre_next_tokens_indices = torch.full(
-                    (num_tokens,), -1, dtype=torch.int32, device=self.device
-                )
+                    (num_tokens,), -1, dtype=torch.int32
+                ).to(self.device)
                 for nlen in next_lens:
-                    next_tokens = torch.zeros(
-                        nlen, dtype=torch.int64, device=self.device
-                    )
+                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -5162,31 +5153,28 @@ class TPUModelRunner(GPUModelRunner):
                 # get_spec_decode_metadata so the graph is byte-identical.
                 dummy_logits = torch.zeros(
                     (num_tokens, self.vocab_size),
-                    device=self.device,
                     dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                draft_token_ids = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
-                draft_token_ids = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                target_logits_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
-                target_logits_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
-                )
-                segment_ids = torch.zeros(
-                    num_tokens, dtype=torch.int64, device=self.device
-                )
-                group_indices = torch.zeros(
-                    num_tokens, dtype=torch.int32, device=self.device
+                segment_ids = torch.zeros(num_tokens, dtype=torch.int64).to(self.device)
+                group_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
+                    self.device
                 )
                 for num_reqs in self.num_reqs_paddings:
                     # padded_num_reqs-shaped inputs.
-                    draft_lengths = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
+                    draft_lengths = torch.zeros(num_reqs, dtype=torch.int32).to(
+                        self.device
                     )
-                    bonus_logits_indices = torch.zeros(
-                        num_reqs, dtype=torch.int32, device=self.device
+                    bonus_logits_indices = torch.zeros(num_reqs, dtype=torch.int32).to(
+                        self.device
                     )
-                    warm_accept_u = torch.zeros(
-                        num_tokens, dtype=torch.float32, device=self.device
+                    warm_accept_u = torch.zeros(num_tokens, dtype=torch.float32).to(
+                        self.device
                     )
                     # --- greedy verify path (do_sampling=False) ---
                     bonus_token_ids, target_logits_warm = (
@@ -5216,19 +5204,17 @@ class TPUModelRunner(GPUModelRunner):
                     warm_temps = torch.zeros(
                         (num_tokens, 1),
                         dtype=self._hidden_states_dtype,
-                        device=self.device,
+                    ).to(self.device)
+                    warm_top_k = torch.zeros((num_tokens, 1), dtype=torch.int32).to(
+                        self.device
                     )
-                    warm_top_k = torch.zeros(
-                        (num_tokens, 1), dtype=torch.int32, device=self.device
-                    )
-                    warm_top_p = torch.ones(
-                        (num_tokens, 1), dtype=torch.float32, device=self.device
+                    warm_top_p = torch.ones((num_tokens, 1), dtype=torch.float32).to(
+                        self.device
                     )
                     warm_recover_u = torch.zeros(
                         (num_tokens, self.vocab_size),
                         dtype=torch.float32,
-                        device=self.device,
-                    )
+                    ).to(self.device)
                     out = self.rejection_sampler(
                         draft_token_ids=draft_token_ids,
                         num_draft_tokens=draft_lengths,
@@ -5521,8 +5507,8 @@ class TPUModelRunner(GPUModelRunner):
             limit = self._bucket_len(num_groups * self.max_num_reqs)
             n = 8
             while n <= limit:
-                src = torch.zeros(n, dtype=torch.long, device=offsets.device)
-                dst = torch.zeros(n, dtype=torch.long, device=offsets.device)
+                src = torch.zeros(n, dtype=torch.long).to(offsets.device)
+                dst = torch.zeros(n, dtype=torch.long).to(offsets.device)
                 _rollback_offsets_seed_compiled(offsets, dst)
                 _rollback_offsets_migrate_compiled(offsets, src, dst)
                 n *= 4
