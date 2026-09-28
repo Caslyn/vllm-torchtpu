@@ -61,7 +61,7 @@ class PromptTokenIdsTensor(torch.Tensor):
 
 
 class TPUMeanPool(SequencePoolingMethod):
-    """TPU-native MeanPool supporting online FP32 accumulation across Chunked Prefill."""
+    """TPU-native MeanPool with online FP32 accumulation across chunked prefill."""
 
     def forward(
         self,

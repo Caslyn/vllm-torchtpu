@@ -151,7 +151,7 @@ def test_build_pooling_metadata_preemption_and_persistence():
 
 
 def test_tpu_mean_pool_single_pass():
-    """Verify TPUMeanPool produces numerically correct embeddings in single-pass prefill."""
+    """Verify TPUMeanPool produces correct embeddings in single-pass prefill."""
     pooler = TPUMeanPool()
     dim = 8
 
@@ -199,7 +199,7 @@ def test_tpu_mean_pool_single_pass():
 
 
 def test_tpu_mean_pool_chunked_prefill_online_accumulation():
-    """Verify TPUMeanPool online FP32 accumulation across multiple chunked prefill steps."""
+    """Verify TPUMeanPool online FP32 accumulation across chunked prefill steps."""
     pooler = TPUMeanPool()
     dim = 4
     total_tokens = 10
@@ -294,7 +294,7 @@ def test_embedding_pooler_head_safe_forward_with_nones():
 
 
 def test_steppool_metadata_tag_resolution():
-    """Verify StepPool metadata resolution and tag filtering using prompt_token_ids_cpu."""
+    """Verify StepPool metadata resolution and tag filtering on prompt_token_ids_cpu."""
     prompt_tokens = [101, 1000, 2000, 102]
     req = MagicMock()
     req.req_id = "step-req"
@@ -347,7 +347,10 @@ def test_steppool_metadata_tag_resolution():
 
 
 def test_last_pool_indices():
-    """Verify pooling_cursor.last_token_indices_gpu correctly extracts the final token of each sequence for LastPool."""
+    """Verify pooling_cursor.last_token_indices_gpu picks each sequence's final token.
+
+    LastPool relies on these indices.
+    """
     # 3 requests with lengths 3, 5, 2 in a packed batch (total 10 tokens)
     prompt_lens = [3, 5, 2]
     total_tokens = sum(prompt_lens)
