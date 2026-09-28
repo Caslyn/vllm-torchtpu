@@ -1574,7 +1574,7 @@ def _dsv4_check_role_rows(
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):
         shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
-        if len(shape) == 4 and shape[1] != rows:
+        if len(shape) in (3, 4) and shape[1] != rows:
             raise ManifestError(
                 f"DSv4 {kv_tag} layer {layer_name} array {role} has "
                 f"{shape[1]} rows; the {tokens}-token page needs {rows}"
@@ -1619,11 +1619,15 @@ def build_dsv4_pool_manifest(
     claimed_by_group: dict[tuple[int, int], str] = {}
     for tag_base, layer_name, group_index, array in entries:
         dtype_tag = _dtype_tag(array)
-        if dtype_tag != "uint8":
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
+        if dtype_tag == "int32" and len(shape) == 3:
+            # CSA NoPE/RoPE and their overlays are int32 word rows (see
+            # `csa_cache_layout`): a packing-1 row of the same 512 bytes.
+            shape = (shape[0], shape[1], 1, shape[2])
+        elif dtype_tag != "uint8":
             raise ManifestError(
                 f"DSv4 cache {layer_name} ({tag_base}) must be uint8; got {dtype_tag}"
             )
-        shape = tuple(int(dim) for dim in getattr(array, "shape", ()))
         if len(shape) != 4:
             raise ManifestError(
                 f"DSv4 cache {layer_name} ({tag_base}) must be "
