@@ -122,6 +122,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
+    SpecLogprobsChunk,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -234,6 +235,48 @@ def _rollback_offsets_migrate(
         else _rollback_offsets_migrate_impl
     )
     fn(read_offsets, src_t, dst_t)
+
+
+def _spec_logprob_row_tokens(
+    next_tokens: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    final_logits_indices: torch.Tensor,
+) -> torch.Tensor:
+    """The token each verify-logits row's slot chose, for gather_logprobs.
+
+    Request `r` owns rows `bonus_logits_indices[r] - draft_lengths[r]`
+    through `bonus_logits_indices[r]`: its draft slots, then its bonus slot,
+    matching the slot columns of the rejection output `next_tokens`
+    ([num_reqs, 1 + K]). Rejected slots, padded requests and rows no slot
+    maps to get token 0; the host drops their rows.
+
+    Padded requests are recognized without a request count: they carry
+    bonus index 0 and no drafts, so their rows start at 0, while every real
+    request after the first starts past the rows of the ones before it.
+
+    Returns an int64 [num_rows, 1] tensor, num_rows = len(final_logits_indices).
+    """
+    num_rows = final_logits_indices.shape[0]
+    num_slots = next_tokens.shape[1]
+    slot = torch.arange(num_slots, device=next_tokens.device, dtype=torch.int64)
+    lengths = draft_lengths.to(torch.int64)
+    start = bonus_logits_indices.to(torch.int64) - lengths
+    req = torch.arange(start.shape[0], device=next_tokens.device, dtype=torch.int64)
+    real_req = (req == 0) | (start > 0)
+    rows = start[:, None] + slot[None, :]
+    valid = (
+        real_req[:, None]
+        & (slot[None, :] <= lengths[:, None])
+        & (next_tokens != INVALID_TOKEN_ID)
+        & (rows < num_rows)
+    )
+    # Invalid slots all land on one extra row that is sliced off below.
+    rows = torch.where(valid, rows, num_rows)
+    tokens = torch.where(valid, next_tokens.to(torch.int64), 0)
+    out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
+    out = out.scatter(0, rows.flatten(), tokens.flatten())
+    return out[:num_rows, None]
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -3848,6 +3891,9 @@ class TPUModelRunner(GPUModelRunner):
         next_token_indices: dict[int, int] = {}
         next_tokens_tpu_offset = 0
         combined_logprobs: list[Any] = []
+        # Spec step only: per-chunk logprobs, filtered to the accepted tokens
+        # once they reach the host (AsyncTPUModelRunnerOutput.get_output).
+        spec_logprobs_chunks: list[SpecLogprobsChunk] = []
 
         # True if the step has drafts to verify (a request carried drafts in
         # from the previous step). Not the same as self.speculative_config, the
@@ -3864,10 +3910,6 @@ class TPUModelRunner(GPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
         elif is_spec_step:
-            if needs_logprobs:
-                raise NotImplementedError(
-                    "Logprobs are not supported with speculative decoding on TPU yet."
-                )
             # Per-chunk device rejection outputs, kept for the async-spec
             # producer below.
             next_tokens_per_chunk: list[torch.Tensor] = []
@@ -3897,6 +3939,23 @@ class TPUModelRunner(GPUModelRunner):
                     self._update_mamba_slot_read_offsets(
                         mamba_indices, next_tokens, num_reqs
                     )
+                    if needs_logprobs:
+                        # Raw verify logits, one row per draft slot and bonus
+                        # slot; each row paired with the token its slot chose.
+                        row_tokens = self.spec_logprob_row_tokens(
+                            next_tokens,
+                            md.bonus_logits_indices,
+                            md.draft_lengths,
+                            md.final_logits_indices,
+                        )
+                        spec_logprobs_chunks.append(
+                            SpecLogprobsChunk(
+                                tensors=self.gather_logprobs(logits, row_tokens),
+                                row_starts=np.concatenate(
+                                    ([0], np.cumsum(md.draft_lengths_cpu + 1)[:-1])
+                                ),
+                            )
+                        )
                 else:
                     if grammar_output is not None:
                         _, logits = self.structured_decoding_manager.mask_spec_logits(
@@ -3938,6 +3997,13 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens.append(padded)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(padded)
+                    if needs_logprobs:
+                        spec_logprobs_chunks.append(
+                            SpecLogprobsChunk(
+                                tensors=self.gather_logprobs(logits, selected),
+                                row_starts=np.arange(num_reqs),
+                            )
+                        )
                     # Non-verify chunk in a spec step: reset the read offsets
                     # (the latest state checkpoint is at the group base).
                     self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
@@ -4066,7 +4132,9 @@ class TPUModelRunner(GPUModelRunner):
         copy_state = None
         if combined_selected_tokens:
             copy_state = AsyncTPUCopyState.from_device_chunks(
-                combined_selected_tokens, combined_selected_tokens_real_lens
+                combined_selected_tokens,
+                combined_selected_tokens_real_lens,
+                spec_logprobs=spec_logprobs_chunks,
             )
 
         if self.scheduler_config.async_scheduling:
@@ -5075,6 +5143,39 @@ class TPUModelRunner(GPUModelRunner):
                 synchronize_tensors(out.logprobs)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
+    def _precompile_spec_logprobs(self) -> None:
+        """Warm the logprobs graphs of a spec-decode verify step.
+
+        A verify step with logprobs runs `spec_logprob_row_tokens` at every
+        (padded_logits_length, padded_num_reqs) bucket the rejection sampler
+        sees, then `gather_logprobs` over padded_logits_length rows, which
+        `_precompile_gather_logprobs` (num_reqs buckets) does not cover.
+        """
+        k = self.speculative_config.num_speculative_tokens
+        max_logits_len = _get_padded_token_len(
+            self.num_tokens_paddings,
+            min(self.max_num_reqs * (k + 1), self.num_tokens_paddings[-1]),
+        )
+        with self._precompile_timed("spec_logprobs"):
+            for num_tokens in self.num_tokens_paddings:
+                if num_tokens > max_logits_len:
+                    break
+                final_logits_indices = torch.zeros(
+                    num_tokens, dtype=torch.int32, device=self.device
+                )
+                for num_reqs in self.num_reqs_paddings:
+                    row_tokens = self.spec_logprob_row_tokens(
+                        torch.zeros(
+                            (num_reqs, k + 1), dtype=torch.int32, device=self.device
+                        ),
+                        torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
+                        torch.zeros(num_reqs, dtype=torch.int32, device=self.device),
+                        final_logits_indices,
+                    )
+                synchronize_tensors(row_tokens)
+                out = self.gather_logprobs(self._dummy_logits(num_tokens), row_tokens)
+                synchronize_tensors(out.logprobs)
+
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
@@ -5302,6 +5403,7 @@ class TPUModelRunner(GPUModelRunner):
                     self._warmup_pcp_mtp_prefill()
                 else:
                     self._precompile_rejection_sampler()
+                    self._precompile_spec_logprobs()
                     # The isolated precompiles above emit standalone fused
                     # programs; the real per-step propose+verify+sampling
                     # dispatch fuses them differently, so the first real
@@ -6286,6 +6388,18 @@ class TPUModelRunner(GPUModelRunner):
         noisy_logits = masked_logits + gumbel_noise
         final_logits = torch.where(is_greedy, logits, noisy_logits)
         return torch.argmax(final_logits, dim=-1, keepdim=True)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def spec_logprob_row_tokens(
+        self,
+        next_tokens: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        final_logits_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return _spec_logprob_row_tokens(
+            next_tokens, bonus_logits_indices, draft_lengths, final_logits_indices
+        )
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def gather_logprobs(
