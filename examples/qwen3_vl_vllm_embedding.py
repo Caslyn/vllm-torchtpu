@@ -93,6 +93,13 @@ def parse_args():
         default=0.95,
         help="TPU memory utilization ratio (default: 0.95)",
     )
+    parser.add_argument(
+        "--pooling-type",
+        type=str,
+        default="LAST",
+        choices=["LAST", "MEAN", "CLS"],
+        help="Sequence pooling method (default: LAST for causal decoder models)",
+    )
     return parser.parse_args()
 
 
@@ -175,7 +182,7 @@ def main(args):
     llm = LLM(
         model=args.model,
         tensor_parallel_size=args.tensor_parallel_size,
-        pooler_config=PoolerConfig(task="embed"),
+        pooler_config=PoolerConfig(task="embed", pooling_type=args.pooling_type),
         trust_remote_code=True,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,

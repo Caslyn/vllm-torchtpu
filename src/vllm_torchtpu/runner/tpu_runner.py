@@ -558,27 +558,24 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if self.is_pooling_model:
-            from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
-            from vllm.v1.worker.tpu_input_batch import InputBatch
+            from vllm_torchtpu.runner.tpu_pooling import (
+                build_pooling_metadata,
+                install_tpu_pooling_patches,
+            )
+
+            install_tpu_pooling_patches()
 
             def get_pooling_metadata(batch):
-                reqs = batch.requests[: batch.num_reqs]
-                pooling_params = [r.pooling_params for r in reqs]
-                pooling_states = [
-                    PoolingStates(r.req_id, r.num_computed_tokens) for r in reqs
-                ]
-                prompt_lens = torch.tensor(
-                    [r.prompt_token_ids_len for r in reqs], dtype=torch.int32
-                )
-                return PoolingMetadata(
-                    prompt_lens=prompt_lens,
-                    prompt_token_ids=None,
-                    prompt_token_ids_cpu=None,
-                    pooling_params=pooling_params,
-                    pooling_states=pooling_states,
-                )
+                return build_pooling_metadata(batch, getattr(self, "requests", None))
 
-            InputBatch.get_pooling_metadata = get_pooling_metadata
+            from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
+            from vllm.v1.worker.tpu_input_batch import InputBatch as TPUInputBatch
+
+            TPUInputBatch.get_pooling_metadata = get_pooling_metadata
+            GPUInputBatch.get_pooling_metadata = get_pooling_metadata
+            self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
+                self.input_batch
+            )
 
         # Parent already set: vllm_config, *_config, device, dtype,
         # max_model_len, max_num_reqs, max_num_tokens, num_query_heads,
@@ -3480,22 +3477,19 @@ class TPUModelRunner(GPUModelRunner):
 
             sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
             layout_plan = self._last_sequence_layout_plan
-            sample_hidden_states = (
-                sequence_layout_planner.maybe_select_logits_hidden_states(
-                    hidden_states, layout_plan, logits_indices
-                )
-            )
-            if sample_hidden_states is None:
+            if self.is_pooling_model:
                 hidden_states = sequence_layout_planner.finalize_hidden_states(
                     hidden_states,
                     layout_plan,
                 )
-                logits = self.compute_selected_logits(hidden_states, logits_indices)
-            else:
-                logits = self.compute_logits_from_hidden_states(sample_hidden_states)
+                logits = torch.empty((0,), device=self.device)
 
-            if self.is_pooling_model:
-                pooling_metadata = self.input_batch.get_pooling_metadata()
+                # Slice to this chunk's request window. When the batch runs as a
+                # single chunk this is a no-op ([0:num_reqs]); with multiple
+                # chunks, unsliced metadata would not match the cursor below.
+                pooling_metadata = self.input_batch.get_pooling_metadata()[
+                    start_index : start_index + num_reqs
+                ]
                 # num_scheduled_tokens_np, seq_lens_cpu for this chunk
                 req_ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
                 num_scheduled_tokens_np = np.array(
@@ -3505,19 +3499,42 @@ class TPUModelRunner(GPUModelRunner):
                     ],
                     dtype=np.int32,
                 )
-                seq_lens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
-                    start_index : start_index + num_reqs
-                ]
+                total_scheduled_tokens = int(num_scheduled_tokens_np.sum())
+                unpadded_hidden_states = hidden_states[:total_scheduled_tokens]
+
+                num_scheduled_tokens_cpu = torch.from_numpy(num_scheduled_tokens_np)
+                seq_lens_cpu = (
+                    self.input_batch.num_computed_tokens_cpu_tensor[
+                        start_index : start_index + num_reqs
+                    ]
+                    + num_scheduled_tokens_cpu
+                )
                 pooling_metadata.build_pooling_cursor(
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     seq_lens_cpu=seq_lens_cpu,
                     device=self.device,
                 )
                 pooler_output = self.model.pooler(
-                    hidden_states=hidden_states,
+                    hidden_states=unpadded_hidden_states,
                     pooling_metadata=pooling_metadata,
                 )
                 pooler_output_list.append(pooler_output)
+            else:
+                sample_hidden_states = (
+                    sequence_layout_planner.maybe_select_logits_hidden_states(
+                        hidden_states, layout_plan, logits_indices
+                    )
+                )
+                if sample_hidden_states is None:
+                    hidden_states = sequence_layout_planner.finalize_hidden_states(
+                        hidden_states,
+                        layout_plan,
+                    )
+                    logits = self.compute_selected_logits(hidden_states, logits_indices)
+                else:
+                    logits = self.compute_logits_from_hidden_states(
+                        sample_hidden_states
+                    )
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -4312,7 +4329,13 @@ class TPUModelRunner(GPUModelRunner):
                 # Move to CPU as expected by vLLM
                 if isinstance(out, torch.Tensor):
                     pooler_output.extend(list(out.cpu().unbind(dim=0)))
-                else:
+                elif isinstance(out, list):
+                    for item in out:
+                        if isinstance(item, torch.Tensor):
+                            pooler_output.append(item.cpu())
+                        else:
+                            pooler_output.append(item)
+                elif out is not None:
                     pooler_output.extend(out)
 
         model_runner_output = ModelRunnerOutput(
