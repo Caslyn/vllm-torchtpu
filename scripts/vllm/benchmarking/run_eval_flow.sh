@@ -11,6 +11,7 @@ RUN_CODE_EVAL=0
 RUN_MM_EVAL=0
 START_SERVER=1
 SKIP_DB_UPLOAD_FLAG=0
+SKIP_PERF_CHECK=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -48,10 +49,16 @@ while [[ $# -gt 0 ]]; do
             SKIP_DB_UPLOAD_FLAG=1
             shift
             ;;
+        # Reports the benchmark without gating it on the config's baseline,
+        # for a run whose serving setup the baseline does not describe.
+        --skip-perf-check)
+            SKIP_PERF_CHECK=1
+            shift
+            ;;
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -289,7 +296,7 @@ fail=0
 # ========================================================
 # 3. Check Perf Regression
 # ========================================================
-if [ -f "$PERF_BASELINE" ]; then
+if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
     echo "=== Checking Perf Regression ==="
     python3 scripts/vllm/benchmarking/check_regression.py \
       --mode perf \

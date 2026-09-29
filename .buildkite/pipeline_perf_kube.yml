@@ -72,8 +72,12 @@ steps:
   # Keyed so the v7x-16 step below can depend on the whole group. A `wait`
   # barrier cannot order it: Buildkite exempts any step with its own depends_on
   # from wait, and that step needs one for the image.
+  #
+  # Not in a K3=1 build, which runs the Kimi-K3 step at the bottom and nothing
+  # else.
   - group: ":kubernetes: Perf and Eval on TPU"
     key: "perf_tpu"
+    if: build.env("K3") != "1"
     steps:
       - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
         <<: *perf_step
@@ -253,7 +257,7 @@ steps:
       - "build_docker"
       - step: "perf_tpu"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -276,7 +280,7 @@ steps:
       - "build_docker"
       - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -308,7 +312,7 @@ steps:
       - "build_docker"
       - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
         allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("NIGHTLY") == "1" && build.env("K3") != "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -324,10 +328,14 @@ steps:
   # Kimi-K3 on one 2x2x4 slice, four hosts of four chips: the tpu7x-32 pod the
   # bare-metal step runs on. That shape has a queue and chips of its own, so
   # this waits only for the image, not for the v7x-8 and v7x-16 steps above.
+  #
+  # Only in a K3=1 build, scheduled nightly at 03:00 PT behind the 02:00
+  # Kimi-K3 1P1D in pipeline_disagg_kube.yml: the 2x2x4 slices also serve
+  # Kimi-K3 development, and this keeps CI on them to that window.
   - label: ":kubernetes: Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
     key: "perf_nightly_kimi_k3_tp32_ep"
     depends_on: "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
+    if: 'build.env("K3") == "1"'
     timeout_in_minutes: 1440
     agents:
       queue: "kube"

@@ -4,7 +4,9 @@
 # combo, saves results locally.
 #
 # Usage:
-#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive]
+#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive] [--serve-only]
+#
+#   --serve-only  start the config's server and wait on it, running no benchmark
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
@@ -44,6 +46,7 @@ CONFIG_NAME="qwen3-coder-480b-fp8-tp8-ep"
 DRY_RUN=0
 RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 KEEP_ALIVE=0
+SERVE_ONLY=0
 HOST=""
 PORT="${PORT:-8000}"
 START_SERVER=1
@@ -67,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             KEEP_ALIVE=1
             shift
             ;;
+        --serve-only)
+            SERVE_ONLY=1
+            shift
+            ;;
         --host)
             HOST="$2"
             START_SERVER=0
@@ -78,7 +85,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
             exit 1
             ;;
     esac
@@ -593,6 +600,13 @@ export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 if [ "$START_SERVER" = "1" ]; then
     trap stop_vllm_server EXIT INT TERM
     start_vllm_server "$max_model_len" "$max_batched_tokens" "$max_num_seqs"
+    # For a caller that drives the server itself, e.g. one engine of a
+    # disaggregated pair, which must not be sent the config's benchmark.
+    if [ "$SERVE_ONLY" = "1" ] && [ "$DRY_RUN" = "0" ]; then
+        echo "Serving until the server exits (--serve-only)"
+        wait "$SERVER_PID"
+        exit $?
+    fi
 fi
 
 exit_code=0
