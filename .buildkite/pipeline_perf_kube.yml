@@ -320,3 +320,22 @@ steps:
       - *kube_plugin
     commands:
       - .buildkite/kubernetes/run_multihost.sh --backend mp glm-5.2-fp8-dp16-ep
+
+  # Kimi-K3 on one 2x2x4 slice, four hosts of four chips: the tpu7x-32 pod the
+  # bare-metal step runs on. That shape has a queue and chips of its own, so
+  # this waits only for the image, not for the v7x-8 and v7x-16 steps above.
+  - label: ":kubernetes: Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
+    key: "perf_nightly_kimi_k3_tp32_ep"
+    depends_on: "build_docker"
+    if: 'build.env("NIGHTLY") == "1"'
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    env:
+      TPU_ACCELERATOR_TYPE: "tpu7x"
+      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+      BENCHMARK_WARMUP_RUNS: "1"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x4 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval
