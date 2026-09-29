@@ -46,8 +46,10 @@ Key components and mechanisms:
 
 - Directory as the single source of truth: `prepare_store` probes Raiden per
   key to decide what to offer, so a key displaced from the LRU is re-offered
-  on its next appearance. The connector emits no eviction events, and
-  configurations that expect KV cache events are refused at startup.
+  on its next appearance. Displacements are also reported back: the manager
+  registers an eviction callback with the store and turns host LRU evictions
+  into `OffloadingEvent`s, which the connector surfaces as `BlockRemoved`
+  KV cache events.
 
 - Fault tolerance and recovery: Failed saves retry once. Timed-out drains
   poison in-flight jobs to prevent committing torn bytes from reused blocks.
@@ -77,7 +79,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCache
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
+    Locality,
     LookupResult,
+    Medium,
+    OffloadingEvent,
     OffloadingManager,
     OffloadingSpec,
     OffloadingWorker,
@@ -327,6 +332,22 @@ class RaidenOffloadingManager(OffloadingManager):
         self._block_status = store_types.BlockStatus
         self._block_id_cls = store_types.RaidenBlockId
         self._raiden_id = self._store.raiden_id
+
+        # Eviction tracking and callback registration with host LRU cache.
+        self._eviction_lock = threading.Lock()
+        self._evicted_sub_hashes: dict[OffloadKey, set[int]] = {}
+        self._evicted_keys_queue: list[OffloadKey] = []
+        # `set_eviction_callback` landed in a recent Raiden wheel; on older
+        # wheels the manager still works, it just never reports removals.
+        # Say so rather than silently dropping BlockRemoved events.
+        self._supports_eviction_callback = hasattr(self._store, "set_eviction_callback")
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(self._on_eviction)
+        else:
+            logger.warning(
+                "Raiden store predates set_eviction_callback(); host LRU "
+                "evictions will not be reported as KV cache events."
+            )
 
         # The connector's only cache-state bookkeeping, and it is
         # load-bearing: it bars a second admission of a key whose store job is
@@ -626,13 +647,57 @@ class RaidenOffloadingManager(OffloadingManager):
             evicted_keys=[],
         )
 
-    def take_events(self):
-        # This manager produces no offloading events: Raiden's admission API
-        # does not report which entries an insert displaced, and `prepare_store`
-        # rediscovers them by probing the directory. Configurations that
-        # consume the event stream are refused at startup (see
-        # `TPURaidenStoreOffloadingSpec.__init__`).
-        return []
+    def _sub_hash_to_offload_key(
+        self, sub_hash: bytes
+    ) -> tuple[OffloadKey, int] | None:
+        """Helper to reverse a Raiden C++ sub_hash to (OffloadKey, sub_idx).
+
+        Structure of sub_hash:
+          [key_namespace] + [OffloadKey] + [4-byte sub_idx (big endian)]
+        """
+        ns_len = len(self._key_namespace)
+        if len(sub_hash) < ns_len + 5:
+            return None
+        if self._key_namespace and not sub_hash.startswith(self._key_namespace):
+            return None
+        key_bytes = sub_hash[ns_len:-4]
+        sub_idx = int.from_bytes(sub_hash[-4:], "big")
+        if sub_idx < 0 or sub_idx >= self._device_block_size_factor:
+            return None
+        return OffloadKey(key_bytes), sub_idx
+
+    def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
+        """Callback invoked by Raiden C++ store upon host LRU cache eviction."""
+        with self._eviction_lock:
+            for sub_hash in evicted_hashes:
+                parsed = self._sub_hash_to_offload_key(sub_hash)
+                if parsed is None:
+                    continue
+                key, sub_idx = parsed
+                sub_indices = self._evicted_sub_hashes.setdefault(key, set())
+                if not sub_indices:
+                    # Report eviction on the first sub-block loss: the logical
+                    # block is no longer intact or retrievable from host cache.
+                    self._evicted_keys_queue.append(key)
+                sub_indices.add(sub_idx)
+                if len(sub_indices) >= self._device_block_size_factor:
+                    self._evicted_sub_hashes.pop(key, None)
+
+    def take_events(self) -> list[OffloadingEvent]:
+        with self._eviction_lock:
+            if not self._evicted_keys_queue:
+                return []
+            evicted = list(self._evicted_keys_queue)
+            self._evicted_keys_queue.clear()
+
+        return [
+            OffloadingEvent(
+                keys=evicted,
+                medium=Medium.CPU,
+                removed=True,
+                locality=Locality.LOCAL,
+            )
+        ]
 
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         # Remote slices stashed by lookup() are consumed by prepare_load()
@@ -660,6 +725,10 @@ class RaidenOffloadingManager(OffloadingManager):
         return bool(self._admissions)
 
     def shutdown(self) -> None:
+        # Unregister first: the callback runs on a Raiden-owned thread and
+        # must not fire into a half-torn-down manager while jobs drain.
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(None)
         if self._admissions:
             self.drain_jobs(set(self._admissions.keys()))
 
@@ -679,6 +748,9 @@ class RaidenOffloadingManager(OffloadingManager):
         account for fails the job closed (rollback + recompute).
         """
         assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        with self._eviction_lock:
+            for key in keys:
+                self._evicted_sub_hashes.pop(key, None)
         sub_hashes = self._expand_keys(keys)
         device_ids = self._expand_device_blocks(device_block_ids)
         slices = [
@@ -1595,18 +1667,6 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         vllm_config: VllmConfig,
         kv_cache_config: KVCacheConfig,
     ):
-        # This connector emits no OffloadingEvents — displaced keys are
-        # rediscovered by `prepare_store`'s directory probe. Refuse
-        # configurations that expect KV cache events rather than silently
-        # dropping BlockRemoved notifications.
-        kv_events = vllm_config.kv_events_config
-        if kv_events is not None and kv_events.enable_kv_cache_events:
-            raise ValueError(
-                "TPURaidenOffloadingConnector: enable_kv_cache_events is not "
-                "supported: the Raiden offload manager does not emit "
-                "offloading events."
-            )
-
         super().__init__(config)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
