@@ -4168,38 +4168,6 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
 
-        # Poll the KV connector only now: the wait above proves the previous
-        # forward finished, so a store deferred behind it can be handed to
-        # raiden in this step rather than the next.
-        self.maybe_wait_for_kv_save()
-        (
-            finished_sending,
-            finished_recving,
-            kv_worker_meta,
-            invalid_block_ids,
-            invalid_block_group_index,
-            kv_connector_stats,
-        ) = self.get_finished_kv_transfers(scheduler_output)
-
-        kv_connector_output = (
-            None
-            if (
-                finished_sending is None
-                and finished_recving is None
-                and kv_worker_meta is None
-                and not invalid_block_ids
-                and kv_connector_stats is None
-            )
-            else _build_kv_connector_output(
-                finished_sending=finished_sending,
-                finished_recving=finished_recving,
-                kv_connector_worker_meta=kv_worker_meta,
-                invalid_block_ids=invalid_block_ids,
-                invalid_block_group_index=invalid_block_group_index,
-                kv_connector_stats=kv_connector_stats,
-            )
-        )
-
         # Unified eagle3 draft propose -- ONE call serving both sync and async
         # (mirrors the tpu-inference reference, where a single
         # propose_draft_token_ids call runs every step and an async bool only
@@ -4243,6 +4211,44 @@ class TPUModelRunner(GPUModelRunner):
                     return_device=is_async,
                     device_seed=device_seed,
                 )
+
+        # Save, poll and clear the KV connector only after the drafter. Its
+        # forward above writes the draft layers' KV into the blocks the target
+        # just filled; a save taken before it, or the save fence
+        # TPURaidenOffloadingConnector records in get_finished, would miss
+        # those writes. (vLLM likewise defers wait_for_save and the metadata
+        # clear past its drafter.) ngram drafts below from host tokens and
+        # writes no KV. The wait above also proves the previous forward
+        # finished, so a store deferred behind it can be handed to raiden in
+        # this step rather than the next.
+        self.maybe_wait_for_kv_save()
+        (
+            finished_sending,
+            finished_recving,
+            kv_worker_meta,
+            invalid_block_ids,
+            invalid_block_group_index,
+            kv_connector_stats,
+        ) = self.get_finished_kv_transfers(scheduler_output)
+
+        kv_connector_output = (
+            None
+            if (
+                finished_sending is None
+                and finished_recving is None
+                and kv_worker_meta is None
+                and not invalid_block_ids
+                and kv_connector_stats is None
+            )
+            else _build_kv_connector_output(
+                finished_sending=finished_sending,
+                finished_recving=finished_recving,
+                kv_connector_worker_meta=kv_worker_meta,
+                invalid_block_ids=invalid_block_ids,
+                invalid_block_group_index=invalid_block_group_index,
+                kv_connector_stats=kv_connector_stats,
+            )
+        )
 
         if self.scheduler_config.async_scheduling:
             # A replicated (draft_tp=1) drafter proposes independently per TP
