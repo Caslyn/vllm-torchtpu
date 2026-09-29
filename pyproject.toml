@@ -126,6 +126,7 @@ markers = [
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
+    "omni: tests that run omni multimodal and diffusion models",
 ]
 
 [tool.ruff]
