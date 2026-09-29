@@ -1296,11 +1296,12 @@ class TestReadOffsetsClearedOnReallocation:
     the previous conversation: silent GDN state corruption, no crash.
     """
 
-    def _make_runner(self, num_blocks=8, width=2):
+    def _make_runner(self, num_blocks=8, width=2, lockstep=False):
         runner = MagicMock(spec=TPUModelRunner)
         runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
         runner._mamba_offset_seeded = set()
         runner._read_offset_scratch = {}
+        runner._dp_lockstep_enabled = lambda: lockstep
         runner.input_batch = MagicMock()
         runner._mamba_state_index_groups = (
             TPUModelRunner._mamba_state_index_groups.__get__(runner)
@@ -1362,6 +1363,46 @@ class TestReadOffsetsClearedOnReallocation:
         assert int(runner.mamba_slot_read_offsets[5]) == 2  # untouched
         assert int(runner.mamba_slot_read_offsets[6]) == 0  # cleared
         assert int(runner.mamba_slot_read_offsets[0]) == 0  # null stays 0
+
+    @pytest.mark.parametrize("lockstep", [False, True])
+    def test_all_seen_batch_skips_device_work_unless_lockstep(
+        self, monkeypatch, lockstep
+    ):
+        """A batch with no new request has nothing to reset. One engine's TP
+        ranks all see that batch, so they skip the upload and launches
+        together. Under EP-DP lockstep, where "new" is rank-local, every rank
+        still issues them."""
+        calls = []
+        real = tpu_runner._reset_read_offsets
+
+        def counting(*args):
+            calls.append(args)
+            real(*args)
+
+        monkeypatch.setattr(tpu_runner, "_reset_read_offsets", counting)
+        runner = self._make_runner(lockstep=lockstep)
+        self._set_batch(runner, ["a"], [5, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (2 if lockstep else 1)
+
+        # A new request is always reset.
+        self._set_batch(runner, ["a", "b"], [5, 6])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (3 if lockstep else 2)
+
+        # "a" leaves; the all-old batch is skipped without lockstep.
+        self._set_batch(runner, ["b"], [6, 0])
+        runner._reset_read_offsets_for_new_requests(0, 1)
+        assert len(calls) == (4 if lockstep else 2)
+
+        # "a" comes back on a recycled slot carrying a stale offset. It was
+        # forgotten when it left, so it counts as new and its slot is cleared.
+        runner.mamba_slot_read_offsets[5] = 2
+        self._set_batch(runner, ["b", "a"], [6, 5])
+        runner._reset_read_offsets_for_new_requests(0, 2)
+        assert len(calls) == (5 if lockstep else 3)
+        assert int(runner.mamba_slot_read_offsets[5]) == 0
 
 
 class TestUnifiedReadOffsetMigration:

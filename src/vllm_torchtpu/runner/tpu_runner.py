@@ -3717,14 +3717,21 @@ class TPUModelRunner(GPUModelRunner):
         from a checkpoint belonging to the previous conversation — silent
         GDN state corruption, not a crash.
 
-        The scatter is issued UNCONDITIONALLY, every step, whether or not
-        any request is new. Under EP-DP lockstep every rank must run the
-        same device program, and which requests are new is rank-local: an
-        early return on "nothing to reset" makes one rank skip device work
-        its peers perform, they fall out of step, and the next collective
-        deadlocks. The mask makes an all-old batch a no-op instead —
-        already-seen requests and padded positions are redirected to slot 0,
-        the null block, whose offset is 0 regardless.
+        Under EP-DP lockstep the scatter is issued every step, whether or
+        not any request is new. Every rank must run the same device program,
+        and which requests are new is rank-local: an early return on
+        "nothing to reset" makes one rank skip device work its peers
+        perform, they fall out of step, and the next collective deadlocks.
+        The mask makes an all-old batch a no-op instead — already-seen
+        requests and padded positions are redirected to slot 0, the null
+        block, whose offset is 0 regardless.
+
+        Without lockstep, the ranks running this program are one engine's
+        TP ranks, which all receive the same SchedulerOutput, so an all-old
+        batch is all-old on every rank and they skip the device work
+        together. On most decode steps that saves the flag upload and the
+        reset program, plus the stack of the per-group indices when there is
+        more than one mamba group.
         """
         if self.mamba_slot_read_offsets is None:
             return
@@ -3737,6 +3744,7 @@ class TPUModelRunner(GPUModelRunner):
         width = groups[0].shape[0]
         keep, keep_dev, null = self._read_offset_reset_scratch(width, groups[0].device)
         keep.zero_()
+        any_new = False
         for i in range(min(num_reqs, max(0, len(req_ids) - start_index))):
             req_id = req_ids[start_index + i]
             if req_id is None or i >= width:
@@ -3744,8 +3752,10 @@ class TPUModelRunner(GPUModelRunner):
             if req_id not in self._mamba_offset_seeded:
                 self._mamba_offset_seeded.add(req_id)
                 keep[i] = True
-        # No `if nothing_new: return` here — see the docstring. The device
-        # work below must be issued on every rank on every step.
+                any_new = True
+        # Skip only when no rank can disagree; see the docstring.
+        if not any_new and not self._dp_lockstep_enabled():
+            return
         keep_dev.copy_(keep, non_blocking=True)
         # Stack groups and reset offsets across all groups in one compiled program.
         stacked = torch.stack(groups) if len(groups) > 1 else groups[0].unsqueeze(0)
