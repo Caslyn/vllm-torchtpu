@@ -3632,6 +3632,17 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
+            if (
+                metadata.reqs_to_send
+                and self.vllm_config.speculative_config is not None
+            ):
+                # Publishing a source lets Raiden read its pinned buffers
+                # immediately, including on a no-forward scheduler step.
+                # Draft KV writes can still be deferred after forward returns;
+                # materialize the model's typed KV views and wait before
+                # handing them to the external transfer engine. Admission's
+                # raw storage buffers alone do not express those writes.
+                synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
                     self._register_stage3_request_blocks_dsv4(metadata)

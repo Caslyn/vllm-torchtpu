@@ -256,6 +256,10 @@ def parse_args() -> argparse.Namespace:
             "PREFIX_E2E_DIVERGENCE_SALT_PREFIX", "prefix-e2e-divergence"
         ),
     )
+    parser.add_argument(
+        "--run-id",
+        help="Fixed prompt run ID for fresh-server regression tests; defaults to time.",
+    )
     return parser.parse_args()
 
 
@@ -269,7 +273,7 @@ def main() -> int:
         raise SystemExit("--max-tokens must be positive")
 
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
-    run_id = int(time.time() * 1000)
+    run_id = args.run_id if args.run_id is not None else str(int(time.time() * 1000))
     hit_attempts = 0
 
     print("=== PREFIX CACHE E2E DIVERGENCE REPRO ===", flush=True)

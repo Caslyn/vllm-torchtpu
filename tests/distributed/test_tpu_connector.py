@@ -47,6 +47,7 @@ from .raiden_test_utils import dsv4_kv_cache_groups, dsv4_materialization
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (  # isort: skip
     LoadMeta,
+    SendMeta,
     TPUConnector,
     TPUConnectorMetadata,
     TPUConnectorScheduler,
@@ -224,6 +225,7 @@ def _make_vllm_config(
     pp_size: int = 1,
 ):
     cfg = MagicMock()
+    cfg.speculative_config = None
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
@@ -4546,6 +4548,93 @@ class TestTPURaidenConnectorWorker:
         self.worker.process_send_load(meta)
 
         assert self.engine.calls == [("register_read", "req", 123, [7, 8])]
+
+    @pytest.mark.parametrize("stage3", [False, True])
+    @pytest.mark.parametrize("write_fails", [False, True])
+    @pytest.mark.parametrize("method", ["mtp", "eagle3", "dflash", "ngram"])
+    def test_spec_source_publication_waits_for_kv_writes(
+        self, monkeypatch, stage3, write_fails, method
+    ):
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden" if stage3 else "zmq")
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1)
+        worker.vllm_config.speculative_config = SimpleNamespace(method=method)
+        # Real typed cache views, including a hybrid state tuple.
+        # The external transfer may read immediately when the source is published.
+        caches = [torch.zeros(1) for _ in range(4)]
+        worker.runner = SimpleNamespace(kv_caches=[caches[0], caches[1:3], caches[3]])
+        worker._raiden_transfer_engine = self.engine
+        worker._raiden_work_unit = SimpleNamespace()
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "producer:27000"
+        published = []
+
+        def read_source(*args, **kwargs):
+            published.append([t.item() for t in caches])
+
+        monkeypatch.setattr(facade, "register_request_blocks", read_source)
+        monkeypatch.setattr(self.engine, "register_read", read_source)
+        fences = []
+
+        def complete_writes(tensors, *, wait):
+            assert [id(t) for t in tensors] == [id(t) for t in caches]
+            assert wait is True
+            fences.append(1)
+            if write_fails:
+                raise RuntimeError("device KV write failed")
+            for value, tensor in enumerate(tensors, 1):
+                tensor.fill_(value)
+
+        monkeypatch.setattr(f"{_MOD}.synchronize_tensors", complete_writes)
+        meta = TPUConnectorMetadata()
+        for index in range(2):
+            meta.reqs_to_send[f"req-{index}"] = SendMeta(
+                uuid=index + 1,
+                local_block_ids=[7 + index],
+                num_tokens=1,
+                expiration_time=1e20,
+            )
+        if write_fails:
+            with pytest.raises(RuntimeError, match="device KV write failed"):
+                worker.process_send_load(meta)
+            assert published == []
+            assert worker._stage3_registered_sends == {}
+            assert worker._legacy_registered_sends == set()
+        else:
+            worker.process_send_load(meta)
+            assert published == [[1, 2, 3, 4], [1, 2, 3, 4]]
+        assert fences == [1]  # One completion boundary for the whole send batch.
+
+    @pytest.mark.parametrize(
+        "producer,method,send",
+        [
+            (True, None, True),
+            (True, None, False),
+            (True, "mtp", False),
+            (False, "mtp", False),
+        ],
+    )
+    def test_spec_source_fence_does_not_change_other_paths(
+        self, monkeypatch, producer, method, send
+    ):
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "zmq")
+        worker = _make_raiden_worker(is_producer=producer)
+        worker._raiden_transfer_engine = self.engine
+        worker.vllm_config.speculative_config = (
+            SimpleNamespace(method=method) if method else None
+        )
+
+        def unexpected_fence(*args, **kwargs):
+            pytest.fail("No speculative source publication needs a fence on this path")
+
+        monkeypatch.setattr(f"{_MOD}.synchronize_tensors", unexpected_fence)
+        meta = TPUConnectorMetadata()
+        if send:
+            meta.reqs_to_send["req"] = SendMeta(
+                uuid=1, local_block_ids=[7], expiration_time=1e20
+            )
+        worker.process_send_load(meta)
+        assert self.engine.calls == ([("register_read", "req", 1, [7])] if send else [])
 
     def test_consumer_submits_loads_to_rank_endpoint(self):
         worker = _make_raiden_worker(is_producer=False)
