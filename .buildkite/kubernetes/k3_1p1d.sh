@@ -64,6 +64,9 @@ head_ip() {
 # starts the engine's workers here; see warm_remote_code.py for why.
 warm_remote_code() {
   local uri
+  # The subshell keeps the config's variables, KV_CACHE_DTYPE among them, out
+  # of this script. Followed, shellcheck reports them as lost (SC2031).
+  # shellcheck source=/dev/null
   uri=$(source "$REPO_DIR/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh" \
     >/dev/null && echo "$MODEL_URI") || return 1
   timeout 600 python3 "$HERE/warm_remote_code.py" "$uri"
