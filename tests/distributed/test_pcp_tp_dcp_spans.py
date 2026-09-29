@@ -105,14 +105,15 @@ def test_fa_pcp_tp_to_dcp_byte_copy(pcp, tp, dtp, dcp, heads, tokens, manager_pa
             )
             assert reg.block_ids == tuple(ids)
             assert reg.dst_space_version == 1
-            # declared_bytes describes the local source, even for a KV
-            # replica that contributes no FA spans (it still owns GDN).
-            assert reg.declared_bytes == len(owned) * geometry.kernel_page_bytes
-            # The controller rejects a non-empty registration whose span sum
-            # differs from declared_bytes, so replicas must not fan out.
-            sent = sum(span.size_bytes for span in reg.spans)
-            assert sent in (0, reg.declared_bytes)
             assert reg.declared_bytes == sum(s.size_bytes * s.count for s in reg.spans)
+            # Without DCP a rank ships its local bytes once or not at all, so
+            # KV replicas must not fan out. With DCP the final stripe's tail
+            # padding legitimately ships more than the local pages.
+            if dcp == 1:
+                assert reg.declared_bytes in (
+                    0,
+                    len(owned) * geometry.kernel_page_bytes,
+                )
             for span in reg.spans:
                 rank = span.dst_unit_ordinal or 0
                 assert span.count == 1 and span.dst_block_index == 0
