@@ -635,8 +635,8 @@ class TPUModelRunner(GPUModelRunner):
         # `initialize_kv_cache` once the mamba pool size is known. See
         # `AttentionMetadata.mamba_slot_read_offsets`.
         self.mamba_slot_read_offsets: torch.Tensor | None = None
-        # req_ids whose read offset has been initialized since they entered
-        # the batch; see `_reset_read_offsets_for_new_requests`.
+        # req_ids whose current state storage has an initialized read offset;
+        # see `_reset_read_offsets_for_new_requests`.
         self._mamba_offset_seeded: set[str] = set()
         # Per-width reusable buffers for that per-step reset; see
         # `_read_offset_reset_scratch`.
@@ -1560,6 +1560,7 @@ class TPUModelRunner(GPUModelRunner):
         for req_id in list(self._mamba_slot_by_req_id.keys()):
             if req_id not in live_req_ids:
                 self._free_mamba_slots.append(self._mamba_slot_by_req_id.pop(req_id))
+                self._mamba_offset_seeded.discard(req_id)
 
         indices = self.mamba_state_indices_cpu[:target_num_reqs]
         indices.fill_(0)
@@ -2207,6 +2208,24 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
+        invalidated_req_ids = (
+            scheduler_output.finished_req_ids
+            | (scheduler_output.preempted_req_ids or set())
+            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        )
+        for req_id in invalidated_req_ids:
+            self._mamba_state_pos.pop(req_id, None)
+        self._mamba_offset_seeded.difference_update(invalidated_req_ids)
+        if self._pre_async_results is not None and invalidated_req_ids:
+            # These results belong to freed KV state, including a finished ID
+            # resubmitted in this step. Other requests retain their source rows.
+            for req_id in invalidated_req_ids:
+                self._pre_async_results.req_id_to_index_copy.pop(req_id, None)
+            self._pre_async_results.request_seq_lens = [
+                record
+                for record in self._pre_async_results.request_seq_lens
+                if record[3] not in invalidated_req_ids
+            ]
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
@@ -2401,7 +2420,6 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
-        K = self.speculative_config.num_speculative_tokens
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -2409,35 +2427,24 @@ class TPUModelRunner(GPUModelRunner):
         req_offset = 0
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
-        # index builder multiplies by the stride). Mixed-batch non-spec chunks
-        # pad their single token to the same `1+K` width.
+        # index builder multiplies by the stride). All chunks carry their next
+        # proposals, even if they did not verify drafts in the current step.
         for nt_chunk, num_reqs, md in zip(
             next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
         ):
+            drafts_chunk = drafts[req_offset : req_offset + num_reqs]
+            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
             if md is not None:
-                drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-                src = assemble_spec_next_tokens(
-                    nt_chunk, drafts_chunk, num_reqs
-                )  # [num_reqs*(1+K)]
                 num_rejected_chunks.append(
                     compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
                 )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
             else:
-                # Mixed-batch non-spec chunk: pad the single sampled token to the
-                # uniform 1+K span (token at slot 0, rest INVALID).
-                token = nt_chunk[:num_reqs, 0]
-                src = torch.full(
-                    (num_reqs, 1 + K),
-                    INVALID_TOKEN_ID,
-                    dtype=token.dtype,
-                    device=token.device,
-                )
-                src[:, 0] = token
-                src = src.reshape(-1)  # [num_reqs*(1+K)]
+                # No drafts were verified this step, so there is no rejection
+                # correction or speculative output-placeholder rollback.
                 num_rejected_chunks.append(
-                    torch.zeros(num_reqs, dtype=torch.int32, device=token.device)
+                    torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
                 )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
@@ -2468,7 +2475,6 @@ class TPUModelRunner(GPUModelRunner):
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
-        K = self.speculative_config.num_speculative_tokens
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -2486,7 +2492,9 @@ class TPUModelRunner(GPUModelRunner):
             )
             for r in range(n):
                 next_token_indices[req_offset + r] = req_offset + r
-                num_draft_per_req[req_offset + r] = K
+                # These drafts belong to the NEXT step. The current prefill
+                # sampled one token and has only one output placeholder.
+                num_draft_per_req[req_offset + r] = 0
             req_offset += n
         spec_num_rejected = (
             torch.cat(num_rejected_chunks) if num_rejected_chunks else None
@@ -3684,17 +3692,22 @@ class TPUModelRunner(GPUModelRunner):
     def _reset_read_offsets_for_new_requests(
         self, start_index: int, num_reqs: int
     ) -> None:
-        """Zero the read offset of every request entering the batch.
+        """Zero the read offset when a request acquires new state storage.
 
         `mamba_slot_read_offsets` is indexed by slot/block id, but a slot
-        outlives the request that wrote it. A request that leaves the batch
-        mid-verify-window leaves `num_accepted - 1` behind, and both layouts
-        hand that storage straight to the next request:
+        outlives the request that wrote it. Releasing state mid-verify-window
+        leaves `num_accepted - 1` behind for the next owner:
 
           * compact -- `_build_mamba_state_indices` returns the slot to
             `_free_mamba_slots` and pops it for a new req_id;
           * unified -- vLLM's block manager frees the state block and
             reallocates it.
+
+        A unified-pool request merely unscheduled for a step still owns its
+        blocks and must retain its checkpoint on reentry. Track it through
+        `self.requests`, not batch membership. `_update_states` invalidates
+        finished/preempted/resumed owners, including immediate ID reuse; the
+        compact allocator invalidates reclaimed slots.
 
         Nothing else clears the entry. `_update_mamba_slot_read_offsets`
         only covers requests already in the batch and runs *after* the
@@ -3719,9 +3732,7 @@ class TPUModelRunner(GPUModelRunner):
         if not groups:
             return
         req_ids = self.input_batch.req_ids
-        # Forget requests that have left, so a later req_id reusing the same
-        # string is still treated as new.
-        self._mamba_offset_seeded &= set(self.input_batch.req_id_to_index.keys())
+        self._mamba_offset_seeded.intersection_update(self.requests)
 
         width = groups[0].shape[0]
         keep, keep_dev, null = self._read_offset_reset_scratch(width, groups[0].device)

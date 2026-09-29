@@ -900,6 +900,7 @@ class TestCompactMambaSlotPool:
         runner.max_num_reqs = max_num_reqs
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
+        runner._mamba_offset_seeded = set()
         runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
         runner.input_batch = MagicMock()
         # Bind the real methods.
@@ -1315,6 +1316,7 @@ class TestReadOffsetsClearedOnReallocation:
     def _set_batch(self, runner, req_ids, state_indices):
         runner.input_batch.req_ids = list(req_ids)
         runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
+        runner.requests = dict.fromkeys(req_ids)
         ctx = MagicMock()
         ctx.mamba_state_indices = torch.tensor(state_indices, dtype=torch.int32)
         ctx.unified_mamba_state_indices = None
@@ -1758,9 +1760,10 @@ class TestAsyncSpecDecodeTokenAccounting:
         runner.input_batch.num_tokens_no_spec[0] = prompt_len
         runner.input_batch.token_ids_cpu[0, :prompt_len] = prompt_tokens
 
-        # Step 0: End of Prefill. _update_placeholder called with K=3 drafts
+        # Step 0: Prefill proposes K=3 drafts for the next step, but verifies
+        # none in this step: only its sampled bonus gets an output placeholder.
         request_seq_lens_0 = [(0, req_state, prompt_len, req_id)]
-        num_draft_0 = {0: 3}
+        num_draft_0 = {0: 0}
         next_token_indices = {0: 0}
         TPUModelRunner._update_placeholder(
             runner,
@@ -1769,9 +1772,8 @@ class TestAsyncSpecDecodeTokenAccounting:
             next_token_indices=next_token_indices,
             num_draft_per_req=num_draft_0,
         )
-        # 4 placeholders (1 bonus + 3 drafts) staged
-        assert runner.input_batch.num_tokens_no_spec[0] == 14
-        assert req_state.output_token_ids == [0, 0, 0, 0]
+        assert runner.input_batch.num_tokens_no_spec[0] == 11
+        assert req_state.output_token_ids == [0]
 
         # Step 1: Start of Decode Step 1. _modify_prev_results for Prefill result.
         # Prefill only had 1 sampled bonus token: [100].
@@ -1789,9 +1791,9 @@ class TestAsyncSpecDecodeTokenAccounting:
         TPUModelRunner._modify_prev_results(runner)
 
         # Rollback check:
-        # output_token_ids should have 4 zeros dropped and [100] added
+        # Replace the single placeholder with the sampled bonus.
         assert req_state.output_token_ids == [100]
-        # num_tokens_no_spec should be rolled back: 14 - 4 + 1 = 11
+        # num_tokens_no_spec stays at 11 - 1 + 1 = 11.
         assert runner.input_batch.num_tokens_no_spec[0] == 11
         # token_ids_cpu slot 10 should be 100
         assert runner.input_batch.token_ids_cpu[0, 10] == 100

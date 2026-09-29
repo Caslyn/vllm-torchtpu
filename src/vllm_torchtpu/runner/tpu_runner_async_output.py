@@ -148,9 +148,10 @@ class AsyncPreResults:
     # on-device so the next step can correct its optimistically-advanced
     # positions/seq_lens. None for non-spec.
     spec_decode_num_rejected_tokens: torch.Tensor | None = None
-    # Spec decode only: per-request draft count proposed this step, keyed by the
-    # request_seq_lens index. _modify_prev_results uses it to size the
-    # (1 + num_draft) optimistic-placeholder rollback. None for non-spec.
+    # Per-request draft count VERIFIED this step, keyed by request_seq_lens
+    # index. Sizes the (1 + num_draft) output placeholders and their rollback;
+    # it does not count proposals for the next step. Bootstrap/non-spec: 0 or
+    # absent entry (None for an entirely non-spec result).
     num_draft_per_req: dict[int, int] | None = None
 
     def wait_for_copy(self) -> torch.Tensor | None:
