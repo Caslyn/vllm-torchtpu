@@ -84,6 +84,7 @@ from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
 from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
+from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
@@ -762,6 +763,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # Pallas attention bookkeeping.
         self._attention_kernels_initialized = False
+        # Set while allocating KV caches: whether every sparse MLA layer
+        # matches the masked-dense routing profile, so requests may be ordered
+        # by KV length. None until a sparse MLA layer is allocated.
+        self._masked_dense_groups_requests: bool | None = None
 
         # CPU staging tensors (TPU prepares inputs on CPU then transfers).
         self.input_ids_cpu = torch.zeros(
@@ -1427,6 +1432,9 @@ class TPUModelRunner(GPUModelRunner):
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
             num_windowed = partition(num_decode, num_reqs - 1, 1)
+        mla_dispatch.maybe_order_prefills_by_kv_len(
+            self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
+        )
         return num_decode, num_windowed
 
     def _build_attention_metadata(
