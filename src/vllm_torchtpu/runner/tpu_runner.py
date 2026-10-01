@@ -94,6 +94,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
+    copy_pool_blocks,
 )
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
@@ -1988,6 +1989,104 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._copy_mamba_state_blocks(self.kv_cache_raw_tensors, src_t, dst_t)
 
+    def _dense_kv_copy_supported(self) -> bool:
+        """Whether CoW copies run on the per-layer KV cache tensors.
+
+        Only when DCP fine-grained prefix hits are active (see
+        ``_patch_vllm_dcp_fine_prefix_hits``), the one config whose copies
+        this path precompiles; any other emitter keeps the generic path.
+        Attention-only models outside the unified pool bind one tensor per
+        layer whose dim 0 is the (kernel-granular) block axis. Mamba state
+        without the unified pool is not block-indexed that way.
+        """
+        from vllm_torchtpu import _dcp_fine_prefix_match_unit
+
+        kv_cache_config = getattr(self, "kv_cache_config", None)
+        if (
+            kv_cache_config is None
+            or kv_cache_config.has_mamba_layers
+            or self.is_unified_pool_used()
+            or not getattr(self, "kv_caches", None)
+        ):
+            return False
+        # Fixed once the KV cache config is set; cache it per config.
+        cached = getattr(self, "_dense_kv_copy_cache", None)
+        if cached is None or cached[0] is not kv_cache_config:
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, self.vllm_config)
+            cached = (kv_cache_config, unit is not None)
+            self._dense_kv_copy_cache = cached
+        return cached[1]
+
+    def _dense_kv_copy_pool_sets(self) -> dict[int, list[torch.Tensor]]:
+        """Group the unique per-layer caches by manager-block split.
+
+        ``kv_caches`` may alias one tensor under several layers (shared KV).
+        A manager block spans ``split = dim0 // num_blocks`` consecutive
+        kernel blocks (under DCP, the rank-local slice of the logical block;
+        every rank copies its own slice under the same block ids). The MLA
+        latent cache and the DSA indexer cache are both such tensors.
+        """
+        num_blocks = self.kv_cache_config.num_blocks
+        pool_sets: dict[int, list[torch.Tensor]] = {}
+        seen: set[int] = set()
+        for cache in self.kv_caches:
+            if id(cache) in seen:
+                continue
+            seen.add(id(cache))
+            assert cache.shape[0] % num_blocks == 0, (
+                f"KV cache dim 0 ({cache.shape[0]}) is not a multiple of "
+                f"num_blocks ({num_blocks})"
+            )
+            pool_sets.setdefault(cache.shape[0] // num_blocks, []).append(cache)
+        return pool_sets
+
+    def _apply_dense_kv_cache_block_copies(self, copies) -> None:
+        """Copy CoW blocks in every per-layer KV cache tensor.
+
+        Pairs fan out by each tensor's split and are padded to the seed-copy
+        bucket ladder with ``(0, 0)`` no-ops, so the compiled program sees a
+        few fixed shapes instead of one per copy count.
+        """
+        assert copies, "dense KV block copy requires at least one pair"
+        for split, pools in self._dense_kv_copy_pool_sets().items():
+            pairs = [
+                (c.src_block_id * split + j, c.dst_block_id * split + j)
+                for c in copies
+                for j in range(split)
+            ]
+            pairs = self._pad_to_bucket(pairs, pad=(0, 0))
+            src_t = torch.tensor([s for s, _ in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            dst_t = torch.tensor([d for _, d in pairs], dtype=torch.int32).to(
+                self.device, non_blocking=True
+            )
+            copy_pool_blocks(pools, src_t, dst_t)
+
+    def _precompile_dense_kv_cache_block_copies(self) -> None:
+        """Warm the dense CoW copy program at every bucket length.
+
+        Only when fine-grained prefix hits can emit copies for this layout
+        (see ``_patch_vllm_dcp_fine_prefix_hits``). Must run while the caches
+        are quiescent, like the seed-copy precompile. All-zero indices copy
+        the null block onto itself.
+        """
+        if not self._dense_kv_copy_supported():
+            return
+        pool_sets = self._dense_kv_copy_pool_sets()
+        # At most one CoW pair per newly scheduled request per step.
+        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+            for split, pools in pool_sets.items():
+                synchronize_tensors(pools)
+                limit = self._bucket_len(self.max_num_reqs * split)
+                n = 8
+                while n <= limit:
+                    src = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    dst = torch.zeros(n, dtype=torch.int32).to(self.device)
+                    copy_pool_blocks(pools, src, dst)
+                    n *= 4
+                synchronize_tensors(pools)
+
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -2258,17 +2357,25 @@ class TPUModelRunner(GPUModelRunner):
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
+        # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
+        # prefix hits on an MLA model: copy with the same donating program.
+        use_dense_copy = bool(
+            copies and not use_page_local_copy and self._dense_kv_copy_supported()
+        )
         # The base implementation uses an advanced-index assignment which
         # TorchTPU functionalizes into a full raw-storage result. Hide only
         # the copy field from it; block zeroing and state updates stay intact.
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
-            if use_page_local_copy
+            if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
+        elif use_dense_copy:
+            self._apply_dense_kv_cache_block_copies(copies)
         return result
 
     def _modify_prev_results(self):
