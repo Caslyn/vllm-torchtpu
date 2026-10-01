@@ -144,7 +144,7 @@ All contributions during this pre-public phase must strictly follow this 4-step 
 
 During this pre-public phase, GitHub does not automatically block merges or show status updates in the usual web UI ways. Pay attention to key differences and rules to watch out for:
 
-- **Missing `ready` Label Fails Fast:** If `buildkite/vllm-torchtpu-ci/pr` fails within seconds reporting `Missing 'ready' label`, that is the presubmit gate, not a test failure. Add the label (see Phase 1) and a fresh build starts automatically.
+- **Missing `ready` Label Fails Fast:** If `buildkite/vllm-torchtpu-ci/pr` fails within seconds reporting `Missing 'ready' label`, that is the presubmit gate, not a test failure. The `Check for Ready Label` GitHub check fails for the same reason. Add the label (see Phase 1) and a fresh build starts automatically.
 - **Watch CI Execution (No Automated Merge Blocking):** GitHub will not disable the merge button while CI is running or failing. Developers must manually monitor CI progress until all checks complete green.
   (Refer to [Section 5: Quick Reference Cheat Sheet](#5-quick-reference-cheat-sheet-gh-commands-links) for `gh pr checks <PR_NUMBER> --watch --fail-fast`)
   You can also check the Buildkite dashboard from the UI: [Buildkite TPU Commons](https://screenshot.googleplex.com/36Qsd6vKhWSjEmb)
@@ -213,6 +213,7 @@ Unmarked tests remain eligible for TPU queues.
   - Post-merge builds on `main`, scheduled nightlies, and manual Buildkite builds — these never look at labels.
   - Docs-only PRs — these already short-circuit earlier and need no label.
   - `pre-commit` and `DCO`, which are GitHub checks and run regardless.
+- **`Check for Ready Label`:** A GitHub check that fails until the PR has the `ready` label, so the reason TPU CI has not run shows up next to `pre-commit` and `DCO`. It turns green as soon as the label is added.
 
 > [!NOTE] The Label Does Not Gate Merging
 > Because this repository has no branch rulesets (see Section 1), the `ready` label controls only whether CI **runs**. It does not block the merge button. The Pre-Merge Verification Checklist is still what protects `main`.
