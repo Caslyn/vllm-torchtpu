@@ -1169,6 +1169,20 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
+    def _relayout_tables(self, model: torch.nn.Module | None) -> None:
+        """Give ``model`` the row-major table layouts the env knobs ask for.
+
+        ``load_model`` relayouts the target inline; this applies the same to
+        the draft, which feeds the same cached Pallas ops and so must share
+        the target's table layout.
+        """
+        if model is None:
+            return
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+            runner_utils.relayout_rope_caches(model)
+        if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
+            runner_utils.relayout_hash_tables(model)
+
     def _truncate_rope_caches(self) -> None:
         """Slice rotary cos_sin caches to max_model_len which can reduce
         the overhead of xla layout data copy. Applicable to text-only.
@@ -4755,6 +4769,12 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
+            # The draft reuses the target's Pallas ops (cached by op name),
+            # which were traced against the target's relayouted tables. Its
+            # own rope caches and hash tables need the same layout, or the
+            # shared op rejects them with RuntimeProgramInputMismatch while
+            # precompiling the draft buckets.
+            self._relayout_tables(getattr(self.drafter, "draft_model", None))
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache
