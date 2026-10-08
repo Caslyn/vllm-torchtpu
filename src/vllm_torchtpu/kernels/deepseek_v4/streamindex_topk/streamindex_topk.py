@@ -1131,6 +1131,7 @@ def streamindex_topk(
                 scheduling_group_id=scheduling_group_id,
                 **spec,
             )
+        assert scores is not None
         return scores
 
     def _common_path(_):
