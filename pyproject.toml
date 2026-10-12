@@ -57,6 +57,8 @@ dependencies = [
     # cpu.txt, ...) except tpu.txt, so it's missing
     # when installing vllm as a plain PyPI dependency for our TPU platform.
     "numba==0.65.0",
+    # sentencepiece 0.2.2 wheel is not available in the transient torch-tpu registry
+    "sentencepiece<0.2.2",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
@@ -116,8 +118,7 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 # on top would overwrite it. Opt in with `pip install -e . --group vllm`.
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d"
 ]
 
 # Required for running tests
@@ -130,7 +131,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]
