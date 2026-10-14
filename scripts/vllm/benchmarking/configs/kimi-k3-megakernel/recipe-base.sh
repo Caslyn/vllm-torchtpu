@@ -119,15 +119,16 @@ HEAD_IP="$DP_ADDRESS"
 PLUGIN_SRC="${REPO_DIR:-/workspace/vllm-torchtpu}/src"
 LOG_DIR="${TMPDIR:-/dev/shm}/k3mk/logs"
 HF_HOME_DIR="${TMPDIR:-/dev/shm}/k3mk/hf-home"
-# Compilation caches persist on the fleet's /cache/jax, keyed by the engine
-# image: a cache filled by one toolchain must not be read by another.
+# Compilation caches, keyed by the engine image: a cache filled by one toolchain
+# must not be read by another. The points run without the fleet's caches
+# (common.sh), so /cache/jax is the container's own disk and empty every boot.
 CACHE_ROOT="/cache/jax/k3-mk/$(printf '%s' "${K3_ENGINE_IMAGE:-unknown}" | sha1sum | cut -c1-12)"
 mkdir -p "$CACHE_ROOT/$_role"/{vllm-runtime,vllm-config,torch_tpu_tier3} "$HF_HOME_DIR" "$LOG_DIR"
 # The checkpoint (gs://tpu-commons-ci/moonshootai/kimi/k3, the doc's revision
 # 9f62e4e9), which the manifest mounts at the path the pre-shard was written
-# from. The pre-shard and the speculator snapshot are in the model bucket every
-# TPU pod mounts at /cache/hf/hub (tpu-ci-models-*); PROVENANCE.txt there
-# records how the pre-shard was made.
+# from. The pre-shard and the speculator snapshot are in the model bucket
+# (tpu-ci-models-*), which the manifest mounts at these two paths under
+# /cache/hf/hub; PROVENANCE.txt in the pre-shard records how it was made.
 MODEL_DIR=/ckpt/k3
 HF_HUB_CACHE_DIR=/cache/hf/hub
 PRESHARDED_DIR="$HF_HUB_CACHE_DIR/presharded/kimi-k3-tp32"
