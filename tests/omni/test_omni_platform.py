@@ -116,6 +116,30 @@ def test_rope_patch_installed():
     )
 
 
+def test_wan_ffn_gelu_fence(monkeypatch):
+    # The Wan FFN returns the GELU output passed through the XLA
+    # optimization barrier (its result must be used, or XLA drops it).
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        ColumnParallelGELU,
+    )
+
+    from vllm_torchtpu.omni import patches
+
+    apply_omni_model_specific_patches()
+    ffn = ColumnParallelGELU(8, 16)
+    x = torch.randn(3, 8)
+    want = torch.nn.functional.gelu(ffn.proj(x), approximate="tanh")
+    fenced = []
+    monkeypatch.setattr(
+        patches,
+        "_optimization_barrier_op",
+        lambda: lambda t: fenced.append(t) or t * 2,
+    )
+    torch.testing.assert_close(ffn(x), want * 2, rtol=0, atol=0)
+    assert len(fenced) == 1
+    torch.testing.assert_close(fenced[0], want, rtol=0, atol=0)
+
+
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
 
