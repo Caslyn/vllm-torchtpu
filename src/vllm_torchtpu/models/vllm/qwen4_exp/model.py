@@ -60,6 +60,8 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
 )
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
+from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
+
 
 def _hc_config(vllm_config: VllmConfig) -> HyperConnectionConfig:
     config = cast(Qwen4ExpTextConfig, vllm_config.model_config.hf_text_config)
@@ -87,7 +89,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
         config = cast(Qwen4ExpTextConfig, vllm_config.model_config.hf_text_config)
         layer_types = config.layer_types
         assert layer_types is not None
-        self.layer_type = layer_types[extract_layer_index(prefix)]
+        layer_index = extract_layer_index(prefix)
+        self.layer_type = layer_types[layer_index]
+
+        # ple_layer_ids is one-indexed; each PLE layer's hash layout follows
+        # its rank among them.
+        self.ple = (
+            Qwen4ExpPLELayer(
+                config,
+                sorted(set(config.ple_layer_ids)).index(layer_index + 1),
+                vllm_config.quant_config,
+                prefix=f"{prefix}.ple",
+            )
+            if layer_index + 1 in config.ple_layer_ids
+            else None
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -116,6 +132,14 @@ class Qwen4ExpDecoderLayer(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
+        if self.ple is not None:
+            # TODO(PLE): read and write the conv windows in the unified pool,
+            # take the PLE inputs from the TPU runner, and add the PLE term to
+            # hidden_states here, before the attention mix.
+            raise NotImplementedError(
+                "Qwen4Exp n-gram PLE needs its inputs and conv state from the "
+                "TPU runner, which does not provide them yet."
+            )
         block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
             block_output = self.linear_attn(hidden_states=block_input)
@@ -192,8 +216,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # TODO(QSA): load the indexer weights once the QSA indexer lands;
             # dense attention does not use them.
             ".self_attn.indexer.": None,
-            # TODO(PLE): load once the n-gram PLE layer lands.
-            ".ple.": None,
+            # PLE hash statistics, which upstream skips as well.
+            "hashstats_": None,
+            "token_lookup": None,
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -263,5 +288,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        mapper = self.hf_to_vllm_mapper
+        if not any(isinstance(module, Qwen4ExpPLELayer) for module in self.modules()):
+            # The checkpoint keeps its PLE weights when ple_layer_ids is
+            # overridden to [].
+            mapper = mapper | WeightsMapper(orig_to_new_substr={".ple.": None})
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
