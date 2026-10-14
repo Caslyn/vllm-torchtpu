@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import (
+    _patch_diffusion_startup_warmup_sync,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -379,3 +380,22 @@ def test_omni_tpu_patches_configuration(monkeypatch):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+
+
+def test_startup_warmup_device_sync(monkeypatch):
+    # The startup warmup must be followed by a device sync so that its pending
+    # deferred TPU ops are not fused into the first request.
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    calls = []
+
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda device=None: calls.append("sync")
+    )
+    monkeypatch.setattr(
+        DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
+    )
+    _patch_diffusion_startup_warmup_sync()
+
+    DiffusionEngine.run_startup_warmup(object())
+    assert calls == ["warmup", "sync"]
