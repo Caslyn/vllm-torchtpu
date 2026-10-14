@@ -37,7 +37,8 @@
 #
 # Environment, from manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml: POD_IP,
 # ROLE_HOST_PREFIX and ROLE_HOST_DOMAIN (host i of this role is
-# <prefix>i.<domain>), DECODE_HOST (decode's index 0), NUM_HOSTS.
+# <prefix>i.<domain>), DECODE_HOST (decode's index 0), NUM_HOSTS; and from
+# kimi-k3-agentx-1p1d.yaml also PREFILL_HOST (prefill's index 0).
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -92,6 +93,9 @@ export K3_1P1D_ROLE="$role"
 K3_1P1D_ENGINE=1
 # What a config launched with --nnodes fills in; empty, they stay set under -u.
 SERVE_ARGS=() K3_1P1D_INPUTS=() K3_1P1D_IMPORTS=()
+# And the global registry and host-store server a config may add beside the
+# engine, with the registry's host:port.
+K3_1P1D_REGISTRY_ARGS=() K3_1P1D_STORE_NODE_ARGS=() K3_1P1D_REGISTRY_ADDRESS=""
 MODEL_URI="${MODEL_URI:-}"
 ENABLE_EP=false
 QUANTIZATION=""
@@ -151,12 +155,61 @@ check_inputs() {
       echo "[input] MISSING the Rust frontend at '${VLLM_RUST_FRONTEND_PATH:-}'"; ok=1
     fi
   fi
+  local cmd cmds=()
+  if [[ "${#K3_1P1D_REGISTRY_ARGS[@]}" -gt 0 && "$INDEX" == "0" ]]; then cmds+=(global_registry_server); fi
+  if [[ "${#K3_1P1D_STORE_NODE_ARGS[@]}" -gt 0 ]]; then cmds+=(kv_cache_host_store_node_main); fi
+  for cmd in "${cmds[@]}"; do
+    if command -v "$cmd" >/dev/null; then echo "[input] ok $cmd"; else echo "[input] MISSING $cmd"; ok=1; fi
+  done
   return "$ok"
+}
+
+# start_registry: the global registry on the prefill head, before its serve;
+# fails unless it listens within a minute. Its output goes to this pod's log.
+start_registry() {
+  local host="${K3_1P1D_REGISTRY_ADDRESS%:*}" port="${K3_1P1D_REGISTRY_ADDRESS##*:}" waited=0
+  echo "--- Starting the global registry at ${K3_1P1D_REGISTRY_ADDRESS}"
+  global_registry_server "${K3_1P1D_REGISTRY_ARGS[@]}" 2>&1 | sed -u 's/^/[registry] /' &
+  until head_listening "$host" "$port"; do
+    if [[ "$waited" -ge 60 ]]; then
+      echo "ERROR: the global registry is not listening after 60 s" >&2
+      return 1
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  echo "the global registry is listening"
+}
+
+# start_store_node: in the background, a host-store server on this decode host
+# once the decode head serves and the registry listens, as the doc starts the
+# servers after the engines are up. Its output goes to this pod's log.
+start_store_node() {
+  (
+    host="${K3_1P1D_REGISTRY_ADDRESS%:*}" port="${K3_1P1D_REGISTRY_ADDRESS##*:}"
+    deadline=$((SECONDS + ${VLLM_ENGINE_READY_TIMEOUT_S:-14400}))
+    until [[ "$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 2 "http://${DP_ADDRESS}:${PORT}/health" || true)" == "200" ]] \
+        && head_listening "$host" "$port"; do
+      if [[ "$SECONDS" -ge "$deadline" ]]; then
+        echo "ERROR: the decode head or the global registry never came up; no store server"
+        exit 1
+      fi
+      sleep 15
+    done
+    echo "--- Starting the host-store server (registry ${K3_1P1D_REGISTRY_ADDRESS})"
+    exec kv_cache_host_store_node_main "${K3_1P1D_STORE_NODE_ARGS[@]}"
+  ) 2>&1 | sed -u 's/^/[store-node] /' &
 }
 
 # K3_1P1D_DRY_RUN=1: print the serve command and environment and stop.
 if [[ "${K3_1P1D_DRY_RUN:-0}" == "1" ]]; then
   printf '[cmd] vllm serve'; printf ' %q' "${SERVE_ARGS[@]}"; echo
+  if [[ "${#K3_1P1D_REGISTRY_ARGS[@]}" -gt 0 && "$INDEX" == "0" ]]; then
+    printf '[cmd] global_registry_server'; printf ' %q' "${K3_1P1D_REGISTRY_ARGS[@]}"; echo
+  fi
+  if [[ "${#K3_1P1D_STORE_NODE_ARGS[@]}" -gt 0 ]]; then
+    printf '[cmd] kv_cache_host_store_node_main'; printf ' %q' "${K3_1P1D_STORE_NODE_ARGS[@]}"; echo
+  fi
   if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
     env | grep -E '^(TPU_|VLLM_|K3_|HF_|TORCH_TPU_|RAIDEN_|LIBTPU_|NPROC=|ONEHOT_|XLA_|PYTHON|TRANSFORMERS_|TMPDIR=)' | sort
     check_inputs || true
@@ -182,6 +235,12 @@ fi
 
 if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
   check_inputs || { echo "ERROR: ${CONFIG}'s inputs are not all there; not booting" >&2; exit 2; }
+  if [[ "${#K3_1P1D_REGISTRY_ARGS[@]}" -gt 0 && "$INDEX" == "0" ]]; then
+    start_registry || exit 2
+  fi
+  if [[ "${#K3_1P1D_STORE_NODE_ARGS[@]}" -gt 0 ]]; then
+    start_store_node
+  fi
   echo "--- Starting ${role} host ${INDEX} of ${NUM_HOSTS} (--nnodes, master ${DP_ADDRESS})"
   # Every host serves until the JobSet ends: the client finishing is what ends
   # the run, and a host that fails fails its role's Job and so the JobSet.

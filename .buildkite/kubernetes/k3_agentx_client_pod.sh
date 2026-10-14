@@ -48,7 +48,8 @@
 #   AGENTX_GSM8K_LIMIT (the probe's size when the env does not set it; 0
 #   skips it), AGENTX_ALLOW_SEQS_BELOW_CONC=1, and the decode topology when
 #   the roles are not plain TP x DP: AGENTX_PREFILL_DCP_SIZE,
-#   AGENTX_DECODE_DCP_SIZE, AGENTX_DECODE_DP_ATTN, AGENTX_DECODE_NUM_WORKERS.
+#   AGENTX_DECODE_DCP_SIZE, AGENTX_DECODE_DP_ATTN, AGENTX_DECODE_NUM_WORKERS;
+#   and AGENTX_DURATION and AGENTX_FAST, which the environment overrides.
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
 #   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
 #   (set by the eval step alone, not the build: a build-level value reaches
@@ -113,7 +114,9 @@ _cfg=$(
         "PREFILL_DCP_SIZE=${AGENTX_PREFILL_DCP_SIZE:-}" \
         "DECODE_DCP_SIZE=${AGENTX_DECODE_DCP_SIZE:-}" \
         "DECODE_DP_ATTN=${AGENTX_DECODE_DP_ATTN:-}" \
-        "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}"
+        "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}" \
+        "DURATION=${AGENTX_DURATION:-}" \
+        "FAST=${AGENTX_FAST:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
 while IFS='=' read -r _k _v; do
     printf -v "CFG_${_k}" '%s' "$_v"
@@ -173,6 +176,10 @@ ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
 [ -z "$CFG_DECODE_NUM_WORKERS" ] || export DECODE_NUM_WORKERS="$CFG_DECODE_NUM_WORKERS"
 # The probe's size: the step's, else the config's, else agentx_client.sh's.
 GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-$CFG_GSM8K_LIMIT}"
+# The replay's length and fast mode: the environment's, else the config's (the
+# Oct 13 recipe points ask for the doc's one-hour run).
+DURATION="${AGENTX_DURATION:-$CFG_DURATION}"
+FAST="${AGENTX_FAST:-$CFG_FAST}"
 
 POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 [ "${AGENTX_SKIP_POST_EVAL:-0}" != 1 ] || POST_EVAL_SUITES="-"
@@ -306,8 +313,8 @@ bash "$IX_DIR/agentx_client.sh" \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
     --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
-    ${AGENTX_DURATION:+--duration "$AGENTX_DURATION"} \
-    ${AGENTX_FAST:+--fast "$AGENTX_FAST"} \
+    ${DURATION:+--duration "$DURATION"} \
+    ${FAST:+--fast "$FAST"} \
     ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
     ${GSM8K_LIMIT:+--gsm8k-limit "$GSM8K_LIMIT"} \
     ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}

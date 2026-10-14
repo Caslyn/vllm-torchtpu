@@ -100,6 +100,8 @@ spec:
                       value: ${WORKLOAD_NAME}
                     - name: DECODE_HOST
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PREFILL_HOST
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
                     # Both roles and the client read this one config.
@@ -235,6 +237,8 @@ spec:
                       value: ${WORKLOAD_NAME}
                     - name: DECODE_HOST
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PREFILL_HOST
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
                     # Both roles and the client read this one config.
