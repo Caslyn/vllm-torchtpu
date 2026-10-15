@@ -74,11 +74,12 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
     """Upstream's draft, admitted under pipeline parallelism.
 
     vLLM's config check requires every model under a pipeline to satisfy
-    `SupportsPP`, which `supports_pp` tests by attribute (the protocol's
-    `forward` signature differs from a draft's, so the class is not a
-    subclass). The pipeline never splits this draft: the last stage builds
-    and runs it whole, and the predictor's forward above takes its embedding
-    branch there.
+    `SupportsPP`; the upstream class inherits it and sets
+    `make_empty_intermediate_tensors` on the instance in `__init__`, so this
+    subclass must not shadow that attribute with a read-only property (doing
+    so fails the assignment: "property ... has no setter"). The pipeline never
+    splits this draft: the last stage builds and runs it whole, and the
+    predictor's forward above takes its embedding branch there.
     """
 
     supports_pp: ClassVar[Literal[True]] = True
