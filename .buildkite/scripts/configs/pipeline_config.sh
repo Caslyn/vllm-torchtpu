@@ -24,9 +24,6 @@ export PRIORITY_DEFAULT=2
 export PRIORITY_NIGHTLY=1
 export PRIORITY_KERNEL_TUNING=-9
 
-# Release branches, exactly releases/vX.Y.Z
-export RELEASE_BRANCH_REGEX='^releases/v[0-9]+\.[0-9]+\.[0-9]+$'
-
 # How many TPU jobs on the kube fleet one author's pull-request builds may have
 # in flight at once, waiting in Kueue or running. The rest wait in Buildkite as
 # `limited`, holding no agent pod and no place in Kueue's queue, so one author's
