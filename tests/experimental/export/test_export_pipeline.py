@@ -467,6 +467,89 @@ def test_recurrent_state_specs_split_conv_channels_and_value_heads(
     )
 
 
+def test_metadata_has_one_serving_config_with_what_the_runtime_reads(tmp_path) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    assert "config" not in meta
+    serving = meta["serving_config"]
+    assert set(serving) == {
+        "vocab_size",
+        "eos_token_id",
+        "max_num_seqs",
+        "max_num_pages",
+        "max_cu_seqs",
+        "block_size",
+        "num_blocks",
+        "max_model_len",
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "data_parallel_size",
+        "tokenizer_config",
+    }
+    assert (serving["vocab_size"], serving["num_blocks"]) == (32, 16)
+
+
+def test_compute_logits_output_is_the_samplers_intermediate_input(tmp_path) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-torch",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyTorchExportableLLM(cfg), out_dir)
+    functions = json.loads(Path(out_dir, "metadata.json").read_text())["functions"]
+    samplers = [
+        "sample_tokens",
+        "sample_tokens_stochastic",
+        "sample_tokens_penalized",
+    ]
+    for req, spec in functions["compute_logits"].items():
+        (logits,) = spec["outputs"]
+        assert (logits["name"], logits["argument_type"]) == ("logits", "intermediate")
+        for fn in samplers:
+            inputs = {t["name"]: t for t in functions[fn][req]["inputs"]}
+            assert inputs["logits"]["argument_type"] == "intermediate", (fn, req)
+            assert inputs["logits"]["shape"] == logits["shape"], (fn, req)
+
+
 @pytest.fixture
 def single_rank_tp_group() -> Any:
     """A one-rank tensor-parallel group: gathering over it returns the input.

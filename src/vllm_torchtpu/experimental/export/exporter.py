@@ -637,7 +637,8 @@ def _export_text_only_llm_functions(
                     name="logits",
                     shape=logits_shape,
                     dtype=logits_dtype_str,
-                    argument_type="user_io",
+                    # Stays on device: the samplers take it as an intermediate input.
+                    argument_type="intermediate",
                     is_input=False,
                 )
             ],
@@ -669,19 +670,12 @@ def _export_text_only_llm_functions(
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
-    """Copies companion files into the artifact and returns the `serving_config` block.
+    """Copies companion files into the artifact; returns their `serving_config` entries.
 
     `tokenizer.json` and `generation_config.json` are copied when the checkpoint has
     them and declared in `serving_config` by path; the runtime reads no other file.
     """
-    serving_config: dict[str, Any] = {
-        "bucket_sizes": [int(b) for b in cfg.token_buckets],
-        "paged_attention": {
-            "block_size": cfg.block_size,
-            "max_num_seqs": cfg.max_num_seqs,
-            "max_num_pages": cfg.max_num_pages,
-        },
-    }
+    serving_config: dict[str, Any] = {}
 
     tokenizer_written = False
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
@@ -788,8 +782,10 @@ def export(
         subdir=subdir,
     )
     functions_dict.update(llm_funcs)
-    serving_config = _emit_model_companion_files(cfg, output_dir)
-    config_block = {
+    # `serving_config` holds only what the runtime reads: the capacities the
+    # executables were exported with, then the companion files. Token buckets are
+    # the `functions.forward` variants and are not repeated here.
+    serving_config = {
         "vocab_size": cfg.vocab_size,
         "eos_token_id": cfg.eos_token_id,
         "max_num_seqs": cfg.max_num_seqs,
@@ -801,6 +797,7 @@ def export(
         "tensor_parallel_size": tp_size,
         "pipeline_parallel_size": pp_size,
         "data_parallel_size": dp_size,
+        **_emit_model_companion_files(cfg, output_dir),
     }
 
     metadata_doc: dict[str, Any] = {
@@ -812,14 +809,13 @@ def export(
             "mesh_shape": [dp_size, tp_size],
             "axis_names": list(_AXIS_NAMES),
         },
-        "config": config_block,
+        "serving_config": serving_config,
         "compile_options": {
             "num_replicas": cfg.num_replicas,
             "num_partitions": cfg.num_partitions,
             "use_spmd_partitioning": cfg.use_spmd_partitioning,
         },
         "functions": functions_dict,
-        "serving_config": serving_config,
     }
 
     with open(os.path.join(output_dir, "metadata.json"), "w") as f:
