@@ -13,39 +13,58 @@
 # limitations under the License.
 """Core declarations, execution config, VMEM pool aliasing, and numeric primitives."""
 
-from . import errors, exec_spec, ops, pool_alias, profiles, spec
+from . import decls, errors, exec_spec, ops, pool_alias, profiles, spec
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .exec_spec import DebugOptions, ExecSpec, Tiles, default_tiles
 from .ops import rup
 from .spec import (
+    REQUIRED,
     Block,
+    BlockBinding,
     ExtraInput,
+    FrozenDict,
+    HFParamDecl,
+    KVCacheDecl,
     LayerType,
     ModelSpec,
+    ParamTransform,
+    RecurrentCacheDecl,
+    ResolvedBlockGeometry,
     ScratchReq,
     SmallField,
     Spec,
     StateDecl,
     SwitchSlot,
+    VLLMAlias,
     WeightDecl,
 )
 
 __all__ = [
+    "REQUIRED",
     "Block",
+    "BlockBinding",
     "DebugOptions",
     "ExecSpec",
     "ExtraInput",
+    "FrozenDict",
+    "HFParamDecl",
+    "KVCacheDecl",
     "LayerType",
     "MegakernelConfigError",
     "MegakernelLayoutError",
     "ModelSpec",
+    "ParamTransform",
+    "RecurrentCacheDecl",
+    "ResolvedBlockGeometry",
     "ScratchReq",
     "SmallField",
     "Spec",
     "StateDecl",
     "SwitchSlot",
     "Tiles",
+    "VLLMAlias",
     "WeightDecl",
+    "decls",
     "default_tiles",
     "errors",
     "exec_spec",

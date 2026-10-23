@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import exec_spec
+from vllm_torchtpu.megakernel import block_options, decls, exec_spec
 from vllm_torchtpu.megakernel import spec as spec_mod
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
@@ -41,22 +41,35 @@ from vllm_torchtpu.megakernel.spec import (
 
 
 def test_spec_imports_only_exec_spec_lazily_or_under_type_checking():
-    """`spec.py` has no top-level internal imports; only `exec_spec` is referenced."""
-    path = Path(spec_mod.__file__)
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for stmt in tree.body:
-        if isinstance(stmt, ast.ImportFrom):
-            assert stmt.level == 0, "top-level imports in spec.py must be stdlib only"
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert alias.name.split(".")[0] in sys.stdlib_module_names
-        elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ""
-            if node.level == 0:
-                assert mod.split(".")[0] in sys.stdlib_module_names
-            else:
-                assert node.level == 1 and mod == "exec_spec", (node.level, mod)
+    """`decls.py` is stdlib-only at runtime; `spec.py` only imports `decls` at top level
+    and `exec_spec` lazily / under `TYPE_CHECKING`."""
+    for mod_obj, top_rel, all_rel in (
+        (decls, set(), {"spec"}),
+        (spec_mod, {"decls"}, {"decls", "exec_spec"}),
+    ):
+        path = Path(mod_obj.__file__)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for stmt in tree.body:
+            if isinstance(stmt, ast.ImportFrom) and stmt.level > 0:
+                assert stmt.level == 1 and (stmt.module or "") in top_rel, (
+                    path.name,
+                    stmt.level,
+                    stmt.module,
+                )
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name.split(".")[0] in sys.stdlib_module_names
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0:
+                    assert mod.split(".")[0] in sys.stdlib_module_names
+                else:
+                    assert node.level == 1 and mod in all_rel, (
+                        path.name,
+                        node.level,
+                        mod,
+                    )
 
 
 def test_spec_declaration_dataclasses_and_defaults():
@@ -85,7 +98,10 @@ def test_spec_declaration_dataclasses_and_defaults():
 
 
 def test_block_subclass_tunables_registration_and_default_hooks(monkeypatch):
-    monkeypatch.setattr(exec_spec, "_TUNABLES", dict(exec_spec._TUNABLES))
+    tunables_copy = dict(block_options._TUNABLES)
+    debug_copy = dict(block_options._DEBUG)
+    monkeypatch.setattr(block_options, "_TUNABLES", tunables_copy)
+    monkeypatch.setattr(block_options, "_DEBUG", debug_copy)
 
     @dataclasses.dataclass(frozen=True)
     class _CustomTunables:
