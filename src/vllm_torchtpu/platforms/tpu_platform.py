@@ -853,10 +853,21 @@ class TpuPlatform(Platform):
                 ),
             )
         else:
+            # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder
+            # (no static graph mode), and the runner needs integer buckets.
+            if strings := [
+                s for s in compilation_config.compile_sizes if isinstance(s, str)
+            ]:
+                raise ValueError(
+                    f"compile_sizes entries must be integers on TPU, got {strings}. "
+                    "List the token sizes to compile instead."
+                )
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
+        # After the sequence-parallel filter, which can drop the largest size.
+        _validate_token_budget_fits_compile_sizes(vllm_config)
 
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
@@ -1440,3 +1451,60 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
             tp,
         )
     cc.compile_sizes = cast(list[int | str], kept)
+
+
+def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
+    """Reject a per-step token budget larger than the largest compile size.
+
+    The runner pads every step to a compile size and asserts that one fits.
+    A server whose budget exceeds the largest compile size starts fine and
+    then crashes on the first large step, for example a decode server with
+    compile_sizes [256] and max_num_batched_tokens 16384 that resumes a
+    preempted request and recomputes its full prompt locally. Fail at startup
+    instead, without changing the user's config.
+
+    vLLM's scheduler bounds a step by max_num_batched_tokens and, when it is
+    smaller, by max_num_scheduled_tokens. vLLM fills max_num_scheduled_tokens
+    from max_num_batched_tokens under speculative decoding, so a set value
+    does not mean the user chose it.
+
+    Under prefill context parallelism a compile size counts rows on one rank.
+    The runner deals a step's tokens to ranks in chunks of
+    cp_kv_cache_interleave_size, round-robin from rank 0
+    (pcp_local_token_counts), so rank 0 holds the most rows and is the one
+    that must fit.
+
+    Raises:
+        ValueError: if a step of the full budget could put more rows on one
+            rank than the largest compile size.
+    """
+    cc = vllm_config.compilation_config
+    sc = vllm_config.scheduler_config
+    if not cc.compile_sizes:
+        return
+    pc = vllm_config.parallel_config
+    pcp = max(1, int(pc.prefill_context_parallel_size))
+    interleave = max(1, int(pc.cp_kv_cache_interleave_size)) if pcp > 1 else 1
+    cycle = pcp * interleave
+    largest = max(int(s) for s in cc.compile_sizes)
+    # The largest step whose rank-0 rows fit `largest`.
+    limit = (largest // interleave) * cycle + largest % interleave
+    budget_flag, budget = "--max-num-batched-tokens", sc.max_num_batched_tokens
+    scheduled = sc.max_num_scheduled_tokens
+    if scheduled is not None and scheduled < budget:
+        budget_flag, budget = "--max-num-scheduled-tokens", scheduled
+    if budget <= limit:
+        return
+    # Rank-0 rows of a full-budget step: the smallest compile size that fits.
+    min_compile_size = (budget // cycle) * interleave + min(budget % cycle, interleave)
+    layout = (
+        f", {pcp} prefill context parallel ranks, interleave {interleave}"
+        if pcp > 1
+        else ""
+    )
+    raise ValueError(
+        f"{budget_flag} ({budget}) exceeds the largest step that fits "
+        f"compile_sizes (largest entry {largest}{layout}: {limit} tokens), so "
+        f"a step could have no compiled size to pad to. Set {budget_flag} to "
+        f"at most {limit}, or add a compile size of at least {min_compile_size}."
+    )

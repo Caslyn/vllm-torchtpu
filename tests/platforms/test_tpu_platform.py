@@ -293,12 +293,17 @@ class TestTpuPlatform:
         vllm_config.compilation_config.mode = MagicMock()
         vllm_config.compilation_config.compile_sizes = [16, 32]
         vllm_config.scheduler_config = MagicMock()
-        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+        # Within the largest compile size, which the platform requires.
+        vllm_config.scheduler_config.max_num_batched_tokens = 32
+        vllm_config.scheduler_config.max_num_seqs = 16
+        vllm_config.scheduler_config.max_num_scheduled_tokens = None
+        vllm_config.scheduler_config.enable_chunked_prefill = True
         vllm_config.scheduler_config.is_multimodal_model = False
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.lora_config = None
         vllm_config.parallel_config = MagicMock()
+        vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
         vllm_config.parallel_config.node_rank = 0
         vllm_config.parallel_config.world_size = 1
@@ -581,6 +586,7 @@ class TestTpuPlatform:
         expected_type,
     ):
         vllm_config.compilation_config.compile_sizes = compile_sizes
+        vllm_config.scheduler_config.max_num_batched_tokens = max(compile_sizes)
         vllm_config.compilation_config.dynamic_shapes_config.type = shapes_type
 
         TpuPlatform.check_and_update_config(vllm_config)
@@ -588,6 +594,39 @@ class TestTpuPlatform:
         assert (
             vllm_config.compilation_config.dynamic_shapes_config.type == expected_type
         )
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_budget_above_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config
+    ):
+        # A step of up to 2048 tokens would have no compile size to pad to.
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
+
+        with pytest.raises(ValueError, match=r"--max-num-batched-tokens \(2048\)"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.max_num_scheduled_tokens is None
+
+    @pytest.mark.parametrize(
+        "compile_sizes",
+        [["cudagraph_capture_sizes"], [16, "cudagraph_capture_sizes"]],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_rejects_string_compile_sizes(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, compile_sizes
+    ):
+        # TPU never expands vLLM's "cudagraph_capture_sizes" placeholder.
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+
+        with pytest.raises(ValueError, match="compile_sizes entries must be integers"):
+            TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
         ("linear", "max_model_len", "added"),
@@ -618,6 +657,7 @@ class TestTpuPlatform:
         monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
         vllm_config.compilation_config.compile_sizes = None
         vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_batched_tokens = 2048
         vllm_config.scheduler_config.max_num_seqs = 8
 
         TpuPlatform.check_and_update_config(vllm_config)
