@@ -200,7 +200,7 @@ def kernel_debug_check(cond: Any, msg: str, *, interpret: bool) -> None:
         jax.debug.callback(_cb, cond)
 
 
-# `ex -> (chunk rows, state ring depth)` of the recurrent block's chunked path.
+# `ex -> (chunk rows, state ring depth)` of the recurrent module's chunked path.
 RecChunk = Callable[[ExecSpec], tuple[int, int]]
 
 
@@ -257,7 +257,7 @@ def make_pool_backend(
     elif supports_pool_gather and rec_chunk is None:
         raise MegakernelConfigError(
             "make_pool_backend(supports_pool_gather=True) needs rec_chunk (the "
-            "recurrent block's chunking, e.g. GDNBlock.chunk_rows): without it "
+            "recurrent module's chunking, e.g. GDNModule.chunk_rows): without it "
             "in-kernel gather is never eligible"
         )
     # Local imports: the kernels import the shared checks from this module.
