@@ -82,6 +82,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
     _patch_sdpa_fallback_dispatch()
+    _patch_ltx2_vocoder_cpu_init()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -428,3 +429,98 @@ def _patch_sdpa_fallback_dispatch() -> None:
     setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
     SDPAImpl.forward = TpuSDPAImpl.forward
     logger.info("Applied TPU patch: SDPAImpl.forward routes to TpuSDPAImpl.")
+
+
+_VOCODER_CPU_INIT_PATCHED = "_tpu_vocoder_cpu_init_patched"
+
+
+def _patch_ltx2_vocoder_cpu_init() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove once torch_tpu implements kaiser_window and sinc, or
+    # vLLM-Omni builds the vocoder and runs
+    # ltx2_runtime._restore_ltx_bwe_resampler_filter on CPU.
+    #
+    # Problem: DiffusersPipelineLoader._init_from_load_format constructs the
+    #   pipeline under a `with torch.device("tpu:N"):` context. LTX-2.3 and
+    #   LTX-2.5 use Diffusers LTX2VocoderWithBWE (`act_fn="snakebeta"`,
+    #   `antialias=True`), whose __init__ builds AntiAliasAct1d -> UpSample1d
+    #   -> kaiser_sinc_filter1d and calls torch.kaiser_window(...) on the
+    #   active default device before weights are loaded, failing on TPU with
+    #   `DispatchStub: missing kernel for tpu`. At decode,
+    #   ltx2_runtime._restore_ltx_bwe_resampler_filter rebuilds the BWE
+    #   resampler's FP32 Hann filter with torch.sinc on the filter's device,
+    #   failing on TPU with `operator 'aten::sinc.out' is not implemented`.
+    # Fix: Constructing the vocoder on CPU (matching text_encoder and
+    #   latent_upsampler in ltx2_components.py) builds the filter buffers on
+    #   the host before _place_aux_components moves the module to
+    #   pipeline.device. The restore helper runs upstream's rebuild on a CPU
+    #   stand-in filter and moves the result to the filter's device, so later
+    #   decodes hit upstream's identity check and skip the rebuild.
+    # Effect: LTX-2.3 loads and decodes on TPU.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.ltx2 import ltx2_components, ltx2_runtime
+
+    _wrap_ltx2_bwe_filter_restore(ltx2_runtime)
+    if getattr(ltx2_components._load_component, _VOCODER_CPU_INIT_PATCHED, False):
+        return
+    orig_load_component = ltx2_components._load_component
+
+    def _cpu_vocoder_load_component(
+        component_cls: Any,
+        model: str,
+        subfolder: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if subfolder == "vocoder":
+            with torch.device("cpu"):
+                return orig_load_component(
+                    component_cls, model, subfolder, *args, **kwargs
+                )
+        return orig_load_component(component_cls, model, subfolder, *args, **kwargs)
+
+    setattr(_cpu_vocoder_load_component, _VOCODER_CPU_INIT_PATCHED, True)
+    ltx2_components._load_component = _cpu_vocoder_load_component
+    logger.info("Applied TPU patch: CPU-context init for LTX-2 vocoder.")
+
+
+_BWE_FILTER_CPU_RESTORE_PATCHED = "_tpu_bwe_filter_cpu_restore_patched"
+
+
+def _wrap_ltx2_bwe_filter_restore(ltx2_runtime: Any) -> None:
+    # _run_ltx_vocoder resolves the helper as an ltx2_runtime global at call
+    # time, so replacing the module attribute covers every caller.
+    restore = ltx2_runtime._restore_ltx_bwe_resampler_filter
+    if getattr(restore, _BWE_FILTER_CPU_RESTORE_PATCHED, False):
+        return
+
+    def _cpu_restore_ltx_bwe_resampler_filter(vocoder: Any) -> None:
+        resampler: Any = getattr(vocoder, "resampler", None)
+        current: Any = getattr(resampler, "filter", None)
+        previous = getattr(resampler, "_ltx_restored_filter", None)
+        if (
+            not isinstance(current, torch.Tensor)
+            or current.device.type == "cpu"
+            or current is previous
+        ):
+            return restore(vocoder)
+        # Upstream reads only the filter's device, never its values.
+        resampler.filter = torch.empty_like(current, device="cpu")
+        try:
+            restore(vocoder)
+        finally:
+            rebuilt: Any = getattr(resampler, "_ltx_restored_filter", None)
+            if rebuilt is previous or resampler.filter is not rebuilt:
+                resampler.filter = current
+            else:
+                rebuilt = rebuilt.to(current.device)
+                resampler.filter = rebuilt
+                resampler._ltx_restored_filter = rebuilt
+
+    setattr(
+        _cpu_restore_ltx_bwe_resampler_filter, _BWE_FILTER_CPU_RESTORE_PATCHED, True
+    )
+    ltx2_runtime._restore_ltx_bwe_resampler_filter = (
+        _cpu_restore_ltx_bwe_resampler_filter
+    )
+    logger.info("Applied TPU patch: CPU rebuild of the LTX-2 BWE resampler filter.")
