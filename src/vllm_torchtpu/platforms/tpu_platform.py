@@ -902,9 +902,13 @@ class TpuPlatform(Platform):
                 model_config.dtype,
             )
             lora_config = vllm_config.lora_config
-            if lora_config is not None and lora_config.lora_dtype == model_config.dtype:
-                # vLLM set lora_dtype "auto" to this dtype before this hook;
-                # the LoRA weights must stay in the dtype the model runs in.
+            if lora_config is not None and lora_config.lora_dtype != torch.bfloat16:
+                # vLLM resolves lora_dtype "auto" to the model dtype before this
+                # hook, so "auto" and an explicit value look the same here. The
+                # LoRA weights must be in the dtype the model runs in.
+                logger.warning(
+                    "Using bfloat16 for LoRA instead of %s.", lora_config.lora_dtype
+                )
                 lora_config.lora_dtype = torch.bfloat16
             model_config.dtype = torch.bfloat16
         # After the bfloat16 switch, so lora_dtype is checked against the
