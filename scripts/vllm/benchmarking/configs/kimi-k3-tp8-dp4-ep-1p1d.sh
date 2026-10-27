@@ -111,7 +111,7 @@ _kv_transfer_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_mod
 # recurrent state lags, or prefix-aware loads turn off for the whole engine,
 # so the counters stage (decode local_cache_hit > 0) guards that too.
 if [ "$_kv_role" = kv_consumer ]; then
-    _offload_config="{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${K3_1P1D_DECODE_CPU_BYTES_TO_USE:-68719476736},\"raiden_controller_port\":48800}}"
+    _offload_config="{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${K3_1P1D_DECODE_CPU_BYTES_TO_USE:-68719476736},\"raiden_controller_port\":28800}}"
     _kv_transfer_config="{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"connectors\":[${_kv_transfer_config},${_offload_config}]}}"
 fi
 EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --kv-transfer-config ${_kv_transfer_config}"

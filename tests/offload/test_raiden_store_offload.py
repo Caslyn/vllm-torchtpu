@@ -2680,6 +2680,153 @@ class TestRaidenStoreWorkerStub(unittest.TestCase):
         self.assertEqual(worker.get_finished(), [])
         self.assertIsNone(worker.wait({1, 2}))
 
+    def test_default_controller_port_outside_linux_ephemeral_range(self):
+        from vllm_torchtpu.offload.raiden_store import (
+            _DEFAULT_CONTROLLER_PORT,
+            _DEFAULT_EPHEMERAL_PORT_RANGE,
+        )
+
+        ephemeral_low, _ = _DEFAULT_EPHEMERAL_PORT_RANGE
+        self.assertGreaterEqual(_DEFAULT_CONTROLLER_PORT, 1024)
+        self.assertLess(_DEFAULT_CONTROLLER_PORT, ephemeral_low)
+
+    def test_controller_reachable_rejects_tcp_loopback_self_connect(self):
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._controller_address = "127.0.0.1:48800"
+
+        self_connected_sock = MagicMock()
+        self_connected_sock.__enter__.return_value = self_connected_sock
+        self_connected_sock.getsockname.return_value = ("127.0.0.1", 48800)
+        self_connected_sock.getpeername.return_value = ("127.0.0.1", 48800)
+
+        with patch(
+            "vllm_torchtpu.offload.raiden_store.socket.create_connection",
+            return_value=self_connected_sock,
+        ):
+            self.assertFalse(worker._controller_reachable())
+
+    def test_controller_reachable_accepts_listening_server(self):
+        import socket
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            for address in (f"127.0.0.1:{port}", f"[127.0.0.1]:{port}"):
+                worker._controller_address = address
+                self.assertTrue(worker._controller_reachable())
+
+        # Once the server closes, probing returns False.
+        self.assertFalse(worker._controller_reachable())
+
+    def test_register_loop_retries_past_self_connect_until_server_listens(self):
+        import threading
+
+        from vllm_torchtpu.offload.raiden_store import RaidenStoreOffloadingWorker
+
+        worker = object.__new__(RaidenStoreOffloadingWorker)
+        worker._device_tensors = []
+        worker._host_blocks_to_allocate = 4
+        worker._controller_address = "127.0.0.1:28800"
+        worker._rank = 0
+        worker._mgr = None
+        worker._backend_configs = []
+        worker._stop_registration = threading.Event()
+
+        self_connected_sock = MagicMock()
+        self_connected_sock.__enter__.return_value = self_connected_sock
+        self_connected_sock.getsockname.return_value = ("127.0.0.1", 28800)
+        self_connected_sock.getpeername.return_value = ("127.0.0.1", 28800)
+
+        server_connected_sock = MagicMock()
+        server_connected_sock.__enter__.return_value = server_connected_sock
+        server_connected_sock.getsockname.return_value = ("127.0.0.1", 50123)
+        server_connected_sock.getpeername.return_value = ("127.0.0.1", 28800)
+
+        kcm_calls: list[dict[str, object]] = []
+
+        def fake_kv_cache_manager(**kwargs: object) -> str:
+            kcm_calls.append(kwargs)
+            return "registered-manager"
+
+        with (
+            patch(
+                "vllm_torchtpu.offload.raiden_store.socket.create_connection",
+                side_effect=[self_connected_sock, server_connected_sock],
+            ) as create_conn,
+            patch.object(worker._stop_registration, "wait", return_value=False),
+            _fake_tpu_sync(
+                FAKE_STORAGE_IMPL, kv_cache_manager_cls=fake_kv_cache_manager
+            ),
+        ):
+            worker._register_loop()
+
+        self.assertEqual(create_conn.call_count, 2)
+        self.assertEqual(len(kcm_calls), 1)
+        self.assertEqual(worker._mgr, "registered-manager")
+
+    def test_get_ephemeral_port_range_parses_procfs_and_falls_back(self):
+        from vllm_torchtpu.offload.raiden_store import (
+            _DEFAULT_EPHEMERAL_PORT_RANGE,
+            _get_ephemeral_port_range,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            proc_file = os.path.join(tmpdir, "ip_local_port_range")
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("40000\t65000\n")
+            self.assertEqual(_get_ephemeral_port_range(proc_file), (40000, 65000))
+
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("65000\t40000\n")
+            self.assertEqual(
+                _get_ephemeral_port_range(proc_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+            with open(proc_file, "w", encoding="utf-8") as fh:
+                fh.write("invalid\n")
+            self.assertEqual(
+                _get_ephemeral_port_range(proc_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+            missing_file = os.path.join(tmpdir, "nonexistent")
+            self.assertEqual(
+                _get_ephemeral_port_range(missing_file), _DEFAULT_EPHEMERAL_PORT_RANGE
+            )
+
+    def test_spec_warns_when_controller_port_in_ephemeral_range(self):
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        with (
+            patch.object(rs, "_get_ephemeral_port_range", return_value=(32768, 60999)),
+            patch.object(rs.logger, "warning") as warning,
+        ):
+            default_spec = _build_spec({})
+            self.assertEqual(default_spec.raiden_controller_port, 27800)
+            warning.assert_not_called()
+
+            ephemeral_spec = _build_spec({"raiden_controller_port": 48800})
+            self.assertEqual(ephemeral_spec.raiden_controller_port, 48800)
+            warning.assert_called_once()
+            rendered = warning.call_args.args[0] % warning.call_args.args[1:]
+            self.assertIn("48800", rendered)
+            self.assertIn("32768..60999", rendered)
+            self.assertIn("raiden_controller_port", rendered)
+
+            warning.reset_mock()
+            dp_offset_spec = _build_spec(
+                {"raiden_controller_port": 32766}, dp_rank_local=2
+            )
+            self.assertEqual(dp_offset_spec.raiden_controller_port, 32768)
+            warning.assert_called_once()
+            dp_rendered = warning.call_args.args[0] % warning.call_args.args[1:]
+            self.assertIn("base=32766 + dp_rank_local=2", dp_rendered)
+
 
 # -- storage tier: settings, backend configs, and plumbing ---------------------
 
@@ -2767,7 +2914,7 @@ def _worker_config(bytes_per_block, *, num_blocks=1):
     )
 
 
-def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
+def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1, dp_rank_local=0):
     """A real TPURaidenStoreOffloadingSpec over stub configs, with kernel
     geometry, the block-major contract, and the namespace patched out. Under
     pipeline parallelism the spec needs the recorded all-ranks bytes, so
@@ -2799,8 +2946,8 @@ def _build_spec(extra_config, *, tp_size=4, pp_size=1, pcp_size=1):
     vllm_config.kv_events_config.enable_kv_cache_events = False
     vllm_config.model_config.is_hybrid = False
     vllm_config.model_config.model = "org/model"
-    vllm_config.parallel_config.data_parallel_rank = 0
-    vllm_config.parallel_config.data_parallel_rank_local = 0
+    vllm_config.parallel_config.data_parallel_rank = dp_rank_local
+    vllm_config.parallel_config.data_parallel_rank_local = dp_rank_local
     kv_cache_config = SimpleNamespace(
         kv_cache_groups=[SimpleNamespace(kv_cache_spec=object())],
         kv_cache_tensors=[object()],
