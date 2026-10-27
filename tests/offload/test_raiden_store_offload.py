@@ -3416,11 +3416,14 @@ class TestStorageBackendConfigs(unittest.TestCase):
             tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4, pp_rank=1, pp_size=2
         )
         self.assertEqual((coords.storage_rank, coords.storage_size), (15, 16))
-        # Every (PP, PCP, TP) tuple gets a distinct storage_rank.
+        # The shard a rank writes is its index among the engine's workers.
+        self.assertEqual(coords.engine_rank, coords.storage_rank)
+        # Every (PP, PCP, TP) tuple gets a distinct engine rank, and the
+        # ranks fill [0, world_size).
         ranks = sorted(
             rs.StorageRankCoords(
                 tp, 2, pcp_rank=pcp, pcp_size=4, pp_rank=pp, pp_size=2
-            ).storage_rank
+            ).engine_rank
             for pp in range(2)
             for pcp in range(4)
             for tp in range(2)
@@ -3485,6 +3488,57 @@ class TestStorageBackendConfigs(unittest.TestCase):
         )
 
 
+def _get_manager_and_worker(
+    spec,
+    *,
+    tp_rank=2,
+    tp_world_size=4,
+    pcp_rank=0,
+    pcp_world_size=1,
+    pp_rank=0,
+    pp_world_size=1,
+):
+    """Build the spec's manager and worker over stubbed parallel groups and
+    return the kwargs each was constructed with."""
+    with (
+        _fake_tpu_sync(FAKE_STORAGE_IMPL),
+        patch(
+            "vllm_torchtpu.offload.raiden_store.RaidenOffloadingManager"
+        ) as manager_cls,
+        patch(
+            "vllm_torchtpu.offload.raiden_store.RaidenStoreOffloadingWorker"
+        ) as worker_cls,
+        # World rank 6 is TP rank 2 of the second data parallel replica.
+        # The worker must not register under it (see TestWorkerNodeId).
+        patch(
+            "vllm.distributed.parallel_state.get_world_group",
+            return_value=SimpleNamespace(rank_in_group=6),
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
+            return_value=tp_rank,
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+            return_value=tp_world_size,
+        ),
+        patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
+        patch(
+            "vllm_torchtpu.distributed.pcp.get_pcp_world_size",
+            return_value=pcp_world_size,
+        ),
+        patch(
+            "vllm.distributed.parallel_state.get_pp_group",
+            return_value=SimpleNamespace(
+                rank_in_group=pp_rank, world_size=pp_world_size
+            ),
+        ),
+    ):
+        spec.get_manager()
+        spec.get_worker(MagicMock())
+    return manager_cls.call_args.kwargs, worker_cls.call_args.kwargs
+
+
 class TestStorageSpec(unittest.TestCase):
     """The spec resolves the tier when it is built, in the scheduler and in
     every worker, and hands the store and each worker its own config."""
@@ -3495,53 +3549,8 @@ class TestStorageSpec(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = tmp.name
 
-    def _get_manager_and_worker(
-        self,
-        spec,
-        *,
-        tp_rank=2,
-        tp_world_size=4,
-        pcp_rank=0,
-        pcp_world_size=1,
-        pp_rank=0,
-        pp_world_size=1,
-    ):
-        with (
-            _fake_tpu_sync(FAKE_STORAGE_IMPL),
-            patch(
-                "vllm_torchtpu.offload.raiden_store.RaidenOffloadingManager"
-            ) as manager_cls,
-            patch(
-                "vllm_torchtpu.offload.raiden_store.RaidenStoreOffloadingWorker"
-            ) as worker_cls,
-            # World rank 6 is TP rank 2 of the second data parallel replica.
-            patch(
-                "vllm.distributed.parallel_state.get_world_group",
-                return_value=SimpleNamespace(rank_in_group=6),
-            ),
-            patch(
-                "vllm.distributed.parallel_state.get_tensor_model_parallel_rank",
-                return_value=tp_rank,
-            ),
-            patch(
-                "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
-                return_value=tp_world_size,
-            ),
-            patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
-            patch(
-                "vllm_torchtpu.distributed.pcp.get_pcp_world_size",
-                return_value=pcp_world_size,
-            ),
-            patch(
-                "vllm.distributed.parallel_state.get_pp_group",
-                return_value=SimpleNamespace(
-                    rank_in_group=pp_rank, world_size=pp_world_size
-                ),
-            ),
-        ):
-            spec.get_manager()
-            spec.get_worker(MagicMock())
-        return manager_cls.call_args.kwargs, worker_cls.call_args.kwargs
+    def _get_manager_and_worker(self, spec, **kwargs):
+        return _get_manager_and_worker(spec, **kwargs)
 
     def test_off_passes_no_configs(self):
         spec = _build_spec({})
@@ -3573,8 +3582,9 @@ class TestStorageSpec(unittest.TestCase):
         self.assertEqual(store_cfg.parallelism.pp_size, -1)
         self.assertNotIn("tp_size", store_cfg.properties)
         self.assertEqual(store_cfg.properties["direct_io"], "true")
-        # The worker registers under its world rank but writes as its TP rank.
-        self.assertEqual(worker_kwargs["rank"], 6)
+        # The worker registers under its engine-local rank -- its TP rank
+        # here, not its world rank -- and writes as its TP rank.
+        self.assertEqual(worker_kwargs["rank"], 2)
         (worker_cfg,) = worker_kwargs["backend_configs"]
         self.assertEqual(
             (worker_cfg.parallelism.tp_rank, worker_cfg.parallelism.tp_size), (2, 4)
@@ -3612,6 +3622,11 @@ class TestStorageSpec(unittest.TestCase):
             self._get_manager_and_worker(
                 spec, tp_rank=0, tp_world_size=1, pcp_rank=0, pcp_world_size=4
             )
+        # The node id the worker registers under comes from the same groups,
+        # so the check holds without a storage tier too.
+        spec = _build_spec({})
+        with self.assertRaisesRegex(AssertionError, "worker group sizes TP=2"):
+            self._get_manager_and_worker(spec, tp_rank=0, tp_world_size=2)
 
     def test_bad_setting_stops_construction(self):
         with self.assertRaisesRegex(ValueError, "pp_size=2"):
@@ -3646,6 +3661,64 @@ class TestStorageSpec(unittest.TestCase):
                 worker_cfg.parallelism.pp_size,
             ),
             (2, 4, 1, 2),
+        )
+
+
+class TestWorkerNodeId(unittest.TestCase):
+    """The node id a worker registers with its engine's store under.
+
+    It is the worker's index within the engine, [0, world_size), from its
+    TP, PCP, and PP group ranks (PP -> PCP -> TP major, the order vLLM lays an
+    engine's ranks out in). The store -- one per data-parallel replica --
+    requires node ids to form that dense range once a global registry is
+    configured, and pairs P2P transfers on them (this replica's worker k
+    reads from the peer's worker k). The world group's rank is not that:
+    under DP + EP it is the global `dp_rank * world_size + k`, which made
+    every replica but the first fail KVCacheStore construction with "worker
+    node ids must form the dense range [0, 1)".
+    """
+
+    def setUp(self):
+        _isolate_storage_env(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def test_node_id_is_the_engine_local_rank_not_the_world_rank(self):
+        # DP=8, TP=1, EP: the only worker of the second replica has world
+        # rank 6 and must register as 0.
+        spec = _build_spec({}, tp_size=1)
+        _, worker_kwargs = _get_manager_and_worker(spec, tp_rank=0, tp_world_size=1)
+        self.assertEqual(worker_kwargs["rank"], 0)
+        # TP=4: TP rank 2 of the second replica (world rank 6) registers as 2.
+        _, worker_kwargs = _get_manager_and_worker(_build_spec({}))
+        self.assertEqual(worker_kwargs["rank"], 2)
+
+    def test_node_id_orders_pp_pcp_tp_major(self):
+        # TP=4, PCP=2: (pcp 1, tp 3) is worker 1 * 4 + 3.
+        spec = _build_spec({}, tp_size=4, pcp_size=2)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=3, tp_world_size=4, pcp_rank=1, pcp_world_size=2
+        )
+        self.assertEqual(worker_kwargs["rank"], 7)
+        # TP=4, PP=2: (pp 1, tp 2) is worker 1 * 4 + 2.
+        spec = _build_spec({}, tp_size=4, pp_size=2)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=2, tp_world_size=4, pp_rank=1, pp_world_size=2
+        )
+        self.assertEqual(worker_kwargs["rank"], 6)
+
+    def test_node_id_matches_the_storage_shard(self):
+        # One identity for both: the shard file a worker writes is the one
+        # a peer's worker of the same node id holds in host memory.
+        spec = _build_spec({"raiden_storage_path": self.root}, tp_size=2, pcp_size=4)
+        _, worker_kwargs = _get_manager_and_worker(
+            spec, tp_rank=1, tp_world_size=2, pcp_rank=3, pcp_world_size=4
+        )
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(worker_kwargs["rank"], 3 * 2 + 1)
+        self.assertEqual(
+            (worker_cfg.parallelism.pcp_rank, worker_cfg.parallelism.tp_rank), (3, 1)
         )
 
 
