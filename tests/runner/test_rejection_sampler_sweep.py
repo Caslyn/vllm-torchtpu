@@ -189,10 +189,6 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
         monkeypatch.setattr(torch.distributed, name, _no_collectives)
     monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda out: None)
     monkeypatch.delenv(FLAG, raising=False)
-    # Every shape and variant is its own dynamic=False graph; the runner widens
-    # Dynamo's limits for that (TPUModelRunner.__init__), which this test skips.
-    monkeypatch.setattr(torch._dynamo.config, "cache_size_limit", 1024)
-    monkeypatch.setattr(torch._dynamo.config, "accumulated_recompile_limit", 1024)
 
     spec_config = (
         SimpleNamespace(
@@ -240,7 +236,15 @@ def test_rotated_sweep_holds_no_collective(monkeypatch, synthetic, optional_path
     )
     torch._dynamo.reset()
     try:
-        TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
+        # Every shape and variant is its own dynamic=False graph; the runner
+        # widens Dynamo's limits for that (TPUModelRunner.__init__), which this
+        # test skips. config.patch, not monkeypatch.setattr: under pytest 9.2
+        # monkeypatch's undo deletes torch config entries for the rest of the
+        # session (pytest-dev/pytest#15287).
+        with torch._dynamo.config.patch(
+            cache_size_limit=1024, accumulated_recompile_limit=1024
+        ):
+            TPUModelRunner._precompile_rejection_sampler(runner)  # type: ignore[arg-type]
     finally:
         # Drop the recording backend's entries so later tests compile afresh.
         torch._dynamo.reset()
