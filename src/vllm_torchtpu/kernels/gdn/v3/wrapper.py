@@ -327,7 +327,6 @@ def outer_kernel(
         "attention_mode",
         "gate_lower_bound",
         "kernel_act_dtype",
-        "kernel_conv_state_dtype",
         "kernel_conv_weight_dtype",
     ),
 )
@@ -362,7 +361,6 @@ def fused_conv1d_gdn(
     zero_initialize_out: bool = True,
     compute_precision: jnp.dtype = jnp.float32.dtype,
     kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
-    kernel_conv_state_dtype: jnp.dtype = jnp.float32.dtype,
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
@@ -429,7 +427,6 @@ def fused_conv1d_gdn(
             executing non-batched sequences.
         compute_precision: Computation precision dtype.
         kernel_act_dtype: Dtype qkv, b and a are cast to before the kernel.
-        kernel_conv_state_dtype: Dtype conv_state is cast to before the kernel.
         kernel_conv_weight_dtype: Dtype conv_weight and conv_bias are cast to
             before the kernel.
         decode_tile_size: Tile size along sequence dimension for decode sequences.
@@ -459,7 +456,6 @@ def fused_conv1d_gdn(
         assert recurrent_dtype is not None
     else:
         assert len(states) == 2
-        states = (states[0].astype(kernel_conv_state_dtype), states[1])
         recurrent_dtype = states[1].dtype
         conv_dtype = states[0].dtype
     # Conv1D reads the compact layout, which needs fp32. The recurrent state
