@@ -204,45 +204,48 @@ def quantized_matmul_kernel(
 
             for i in range(steps_k):
                 k_start, k_end = i * block_size, (i + 1) * block_size
-                lhs_sub = lhs_ref[:, k_start:k_end].astype(jnp.float32)
-                lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)
-                lhs_scale = lhs_scale.astype(acc_dtype)
+                with jax.named_scope("bmm_lhs_quantize_block"):
+                    lhs_sub = lhs_ref[:, k_start:k_end].astype(jnp.float32)
+                    lhs_q, lhs_scale = util.quantize_block(lhs_sub, 1, x_q_dtype)
+                    lhs_scale = lhs_scale.astype(acc_dtype)
 
-                rhs_q_full = rhs_ref[:, k_start:k_end]
-                rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
+                    rhs_q_full = rhs_ref[:, k_start:k_end]
+                    rhs_scale_full = w_scales_ref[i, :, :].astype(acc_dtype)
 
                 for j in range(steps_n):
                     n_start, n_end = j * compute_tile_n, (j + 1) * compute_tile_n
 
-                    rhs_q_slice = rhs_q_full[n_start:n_end, :]
-                    rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
-                    if jnp.issubdtype(x_q_dtype, jnp.integer):
-                        preferred_element_type = jnp.int32
-                    else:
-                        preferred_element_type = jnp.float32
-                    dot_res = jax.lax.dot_general(
-                        lhs_q,
-                        rhs_q_slice,
-                        (((1,), (1,)), ((), ())),
-                        preferred_element_type=preferred_element_type,
-                    )
-                    res = dot_res.astype(acc_dtype)
-                    res = res * lhs_scale
-                    res = res * rhs_scale_slice
-                    if i == 0:
-                        accumulators[j] = res
-                    else:
-                        accumulators[j] += res
+                    with jax.named_scope("bmm_fp8_dot_and_scale"):
+                        rhs_q_slice = rhs_q_full[n_start:n_end, :]
+                        rhs_scale_slice = rhs_scale_full[:, n_start:n_end]
+                        if jnp.issubdtype(x_q_dtype, jnp.integer):
+                            preferred_element_type = jnp.int32
+                        else:
+                            preferred_element_type = jnp.float32
+                        dot_res = jax.lax.dot_general(
+                            lhs_q,
+                            rhs_q_slice,
+                            (((1,), (1,)), ((), ())),
+                            preferred_element_type=preferred_element_type,
+                        )
+                        res = dot_res.astype(acc_dtype)
+                        res = res * lhs_scale
+                        res = res * rhs_scale_slice
+                        if i == 0:
+                            accumulators[j] = res
+                        else:
+                            accumulators[j] += res
 
-            acc_block = jnp.concatenate(accumulators, axis=1)
+            with jax.named_scope("bmm_epilogue_store"):
+                acc_block = jnp.concatenate(accumulators, axis=1)
 
-            if not is_first_step:
-                acc_block += acc_scratch[...]
+                if not is_first_step:
+                    acc_block += acc_scratch[...]
 
-            if is_last_step:
-                out_ref[...] = acc_block.astype(out_ref.dtype)
-            else:
-                acc_scratch[...] = acc_block
+                if is_last_step:
+                    out_ref[...] = acc_block.astype(out_ref.dtype)
+                else:
+                    acc_scratch[...] = acc_block
 
         unfold_args((is_first_step, is_last_step), (), accum)
 

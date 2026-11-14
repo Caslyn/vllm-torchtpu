@@ -37,19 +37,21 @@ def causal_conv1d(
 
     out_list = []
 
-    for c_idx in range(cfg.chunk_size):
-        out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
+    with jax.named_scope("gdn_conv1d_sliding_window"):
+        for c_idx in range(cfg.chunk_size):
+            out = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
 
-        end_idx = c_idx + cfg.prev_kernel_size
-        start_idx = 1 + end_idx - cfg.kernel_size
-        for k in range(cfg.kernel_size):
-            lhs_curr = lhs[:, start_idx + k]
-            out += lhs_curr * conv_weight[k : k + 1]
+            end_idx = c_idx + cfg.prev_kernel_size
+            start_idx = 1 + end_idx - cfg.kernel_size
+            for k in range(cfg.kernel_size):
+                lhs_curr = lhs[:, start_idx + k]
+                out += lhs_curr * conv_weight[k : k + 1]
 
-        if conv_bias is not None:
-            out += conv_bias.reshape(1, 1, -1)
+            if conv_bias is not None:
+                out += conv_bias.reshape(1, 1, -1)
 
-        out_list.append(out)
+            out_list.append(out)
+        conv_out = jnp.stack(out_list, axis=1)
 
     # Last prev_kernel_size elements needs to be returned as conv_state. However,
     # real_sizes may be smaller than chunk_size. Therefore, slicing last
@@ -61,17 +63,19 @@ def causal_conv1d(
     state_list = []
     # NOTE: Even though for loop is invoked multiple times, since they are
     # static loops, compiler will perform loop fusion.
-    for w_idx in range(cfg.window_size):
-        last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
-        # Checkpoint of sequences whose last real token is at or past this
-        # window position; shorter ones are picked by the masking loop below.
-        new_conv_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
-        for c_idx in range(1, last_row):
-            new_conv_state = jnp.where(
-                c_idx == real_sizes,
-                lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
-                new_conv_state,
-            )
-        state_list.append(new_conv_state)
+    with jax.named_scope("gdn_conv1d_state_extract"):
+        for w_idx in range(cfg.window_size):
+            last_row = 1 + cfg.chunk_size - cfg.window_size + w_idx
+            # Checkpoint of sequences whose last real token is at or past this
+            # window position; shorter ones are picked by the masking loop below.
+            new_conv_state = lhs[:, last_row : last_row + cfg.prev_kernel_size]
+            for c_idx in range(1, last_row):
+                new_conv_state = jnp.where(
+                    c_idx == real_sizes,
+                    lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
+                    new_conv_state,
+                )
+            state_list.append(new_conv_state)
+        state_out = jnp.stack(state_list, axis=1)
 
-    return jnp.stack(out_list, axis=1), jnp.stack(state_list, axis=1)
+    return conv_out, state_out

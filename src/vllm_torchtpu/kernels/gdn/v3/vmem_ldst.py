@@ -171,6 +171,154 @@ def load_and_select_states(
     return real_sizes, prev_conv_state, prev_recurrent_state
 
 
+def load_and_select_conv_state(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    conv_state_in_slot_ref: jax.Ref,
+    carry_conv_scratch_ref: jax.Ref | None,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Load and select the conv state for each sequence slot in this tile."""
+    with jax.named_scope("gdn_load_conv_state"):
+        real_sizes_list = []
+        prev_conv_state_list = []
+
+        for idx in range(cfg.seq_tile_size):
+            rec = metadata_ref.get_record(p_id, idx)
+            has_initial_state = metadata_ref.s_idx_has_initial_state[rec.s_idx]
+
+            # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
+            hbm_conv_state = conv_state_in_slot_ref[idx, 0].astype(jnp.float32)
+            prev_conv_state = jnp.where(has_initial_state, hbm_conv_state, 0)
+
+            if carry_conv_scratch_ref is not None:
+                prev_tile_conv = carry_conv_scratch_ref[idx]
+                prev_conv_state = jnp.where(
+                    rec.is_first_tile, prev_conv_state, prev_tile_conv
+                )
+
+            real_sizes_list.append(rec.r_size)
+            prev_conv_state_list.append(prev_conv_state)
+
+        real_sizes = jnp.stack(real_sizes_list, axis=0)
+        prev_conv_state = jnp.stack(prev_conv_state_list, axis=0)
+        return real_sizes, prev_conv_state
+
+
+def load_and_select_recurrent_state(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    recurrent_in_slot_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    cfg: config.GDNConfig,
+    *,
+    upcast_f32: bool = True,
+) -> jax.Array:
+    """Load and select the recurrent state for each sequence slot in this tile."""
+    with jax.named_scope("gdn_load_recurrent_state"):
+        prev_recurrent_state_list = []
+
+        for idx in range(cfg.seq_tile_size):
+            rec = metadata_ref.get_record(p_id, idx)
+            has_initial_state = metadata_ref.s_idx_has_initial_state[rec.s_idx]
+
+            hbm_recurrent_state = pltpu.bitcast(
+                recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
+            )
+            if upcast_f32:
+                hbm_recurrent_state = hbm_recurrent_state.astype(jnp.float32)
+            prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
+
+            if carry_recurrent_scratch_ref is not None:
+                prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
+                if not upcast_f32:
+                    prev_tile_recurrent_scratch = prev_tile_recurrent_scratch.astype(
+                        prev_recurrent_state.dtype
+                    )
+                prev_recurrent_state = jnp.where(
+                    rec.is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
+                )
+
+            prev_recurrent_state_list.append(prev_recurrent_state)
+
+        return jnp.stack(prev_recurrent_state_list, axis=0)
+
+
+def load_as_qkv_compact(
+    qkv_vreg: jax.Array,
+    qkv_vmem_ref: jax.Ref,
+    b_vmem_ref: jax.Ref,
+    a_vmem_ref: jax.Ref,
+    cfgs: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Load activations from VMEM as a compact layout."""
+    with jax.named_scope("gdn_unpack_qkvba_compact"):
+        return load_activation_as_compact(
+            qkv_vreg, qkv_vmem_ref, b_vmem_ref, a_vmem_ref, cfgs
+        )
+
+
+def load_as_qkv_large(
+    qkv_vreg: jax.Array,
+    qkv_vmem_ref: jax.Ref,
+    b_vmem_ref: jax.Ref,
+    a_vmem_ref: jax.Ref,
+    cfgs: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Load activations from VMEM as a large layout."""
+    with jax.named_scope("gdn_unpack_qkvba_large"):
+        return load_activation_as_large(
+            qkv_vreg, qkv_vmem_ref, b_vmem_ref, a_vmem_ref, cfgs
+        )
+
+
+def load_ba_as_large(
+    b_vmem_ref: jax.Ref,
+    a_vmem_ref: jax.Ref,
+    cfgs: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """Load only b and a from VMEM in the large layout (leaving qkv in VMEM)."""
+    with jax.named_scope("gdn_unpack_ba_large"):
+        b_large = jnp.expand_dims(load_compact_to_large(b_vmem_ref), axis=1)
+        if cfgs.is_kda:
+            a_large_list = [
+                load_strided_heads(
+                    a_vmem_ref.at[idx], cfgs.num_v_heads, cfgs.kq_head_dim
+                )
+                for idx in range(cfgs.seq_tile_size)
+            ]
+            a_large = jnp.stack(a_large_list, axis=0)
+        else:
+            a_large = jnp.expand_dims(load_compact_to_large(a_vmem_ref), axis=1)
+        return b_large, a_large
+
+
+def qkv_head_cols(
+    cfgs: config.GDNConfig,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return 128-lane column indices in qkv_vmem_ref for each q, k, and v head."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    assert cfgs.kq_head_dim == num_lanes
+    assert cfgs.v_head_dim == num_lanes
+    nq = cfgs.num_kq_heads
+    nv = cfgs.num_v_heads
+    q_cols = tuple(range(nq))
+    k_cols = tuple(nq + h for h in range(nq))
+    v_cols = tuple(2 * nq + h for h in range(nv))
+    return q_cols, k_cols, v_cols
+
+
+def load_qkv_col(
+    qkv_vmem_ref: jax.Ref, col: int, row_stop: int | None = None
+) -> jax.Array:
+    """Load one 128-wide head column `[chunk_size, 128]` for seq 0 from qkv_vmem_ref."""
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    start = col * num_lanes
+    if row_stop is None:
+        return qkv_vmem_ref[0, :, 0, start : start + num_lanes]
+    return qkv_vmem_ref[0, :row_stop, 0, start : start + num_lanes]
+
+
 def load_activation_as_compact(
     qkv_vreg: jax.Array,
     qkv_vmem_ref: jax.Ref,

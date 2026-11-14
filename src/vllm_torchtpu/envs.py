@@ -99,6 +99,8 @@ if TYPE_CHECKING:
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
+    TPU_GDN_MXU_OPERAND_DTYPE: str = ""
+    TPU_GDN_MXU_FP8_MODE: str = "unscaled"
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -505,6 +507,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block boundary. Set it to the same value on every rank and PP stage: the
     # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
+    # Optional MXU operand dtype override for the GDN v3 kernel (e.g.
+    # "float8_e4m3fn" or "bfloat16"). Empty string keeps the default
+    # bfloat16 MXU operand dtype.
+    "TPU_GDN_MXU_OPERAND_DTYPE": env_str("TPU_GDN_MXU_OPERAND_DTYPE", ""),
+    # Mode string for the GDN v3 FP8 / high-chunk prefill schedule (e.g.
+    # "hc:bj8+db64+..."). Defaults to "unscaled".
+    "TPU_GDN_MXU_FP8_MODE": env_str("TPU_GDN_MXU_FP8_MODE", "unscaled"),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.

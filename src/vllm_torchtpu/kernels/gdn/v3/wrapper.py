@@ -51,6 +51,7 @@ def inner_kernel(
     weights_ref: memory_ref.WeightRefs,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    qpad_scratch_ref: jax.Ref | None = None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -77,6 +78,7 @@ def inner_kernel(
             convolution carry.
         carry_recurrent_scratch_ref: Optional VMEM scratch reference for inter-tile
             recurrent state carry.
+        qpad_scratch_ref: Optional VMEM scratch reference for zero-padded Q rows.
         cfg: GDN configuration object.
         p_id: Optional explicit tile index. Communication-fused outer kernels
             pass their global compute-tile index because their surrounding
@@ -86,16 +88,22 @@ def inner_kernel(
     if p_id is None:
         p_id = pl.program_id(0)
 
-    # Prepare states.
-    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
-        metadata_ref=metadata_ref,
-        p_id=p_id,
-        conv_state_in_slot_ref=conv_state_in_slot_ref,
-        recurrent_in_slot_ref=recurrent_in_slot_ref,
-        carry_conv_scratch_ref=carry_conv_scratch_ref,
-        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-        cfg=cfg,
+    stream_io, use_fout, use_fstate = compute_gdn.hc_stream_io(cfg)
+    use_fstate = (
+        use_fstate
+        and carry_recurrent_scratch_ref is not None
+        and not cfg.use_recurrent
+        and not cfg.is_kda
     )
+
+    with jax.named_scope("gdn_stage0_state_init"):
+        real_sizes, prev_conv = vmem_ldst.load_and_select_conv_state(
+            metadata_ref=metadata_ref,
+            p_id=p_id,
+            conv_state_in_slot_ref=conv_state_in_slot_ref,
+            carry_conv_scratch_ref=carry_conv_scratch_ref,
+            cfg=cfg,
+        )
 
     # Step 1: Conv1D.
     # NOTE: Conv1D requires performing sliding window where inputs are slided
@@ -103,31 +111,37 @@ def inner_kernel(
     # single register which necessitate costly shuffling for every sliding.
     # Therefore, it is extremely important to leverage compact layout that
     # ensures 1 register only stores data from 1 row.
-    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
-    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
+    with jax.named_scope("gdn_stage1_causal_conv1d"):
+        qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+        qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
 
-    # Prepare conv1d weights.
-    conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
-    conv_bias = None
-    if weights_ref.conv.bias is not None:
-        conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
+        # Prepare conv1d weights.
+        conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
+        conv_bias = None
+        if weights_ref.conv.bias is not None:
+            conv_bias = weights_ref.conv.bias[...].astype(jnp.float32)
 
-    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
-        real_sizes=real_sizes,
-        lhs=qkv_in_compact,
-        conv_weight=conv_weight,
-        conv_bias=conv_bias,
-        cfg=cfg,
-    )
+        qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+            real_sizes=real_sizes,
+            lhs=qkv_in_compact,
+            conv_weight=conv_weight,
+            conv_bias=conv_bias,
+            cfg=cfg,
+        )
 
-    conv_state_out_slot_ref[...] = new_conv_state.astype(conv_state_out_slot_ref.dtype)
-    if carry_conv_scratch_ref is not None:
-        # The next tile resumes from the state after this tile's last token,
-        # which is the final checkpoint.
-        carry_conv_scratch_ref[...] = new_conv_state[:, -1]
+    with jax.named_scope("gdn_stage1_silu_and_conv_store"):
+        conv_state_out_slot_ref[...] = new_conv_state.astype(
+            conv_state_out_slot_ref.dtype
+        )
+        if carry_conv_scratch_ref is not None:
+            # The next tile resumes from the state after this tile's last token,
+            # which is the final checkpoint.
+            carry_conv_scratch_ref[...] = new_conv_state[:, -1]
 
-    # Apply activation function.
-    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+        # Apply activation function.
+        qkv_out_compact = jax.nn.silu(qkv_out_compact)
+        qkv_slot_ref[...] = qkv_out_compact.astype(qkv_slot_ref.dtype)
+        del prev_conv, qkv_in_compact, new_conv_state, conv_weight, conv_bias
 
     # Step 2: GDN.
 
@@ -136,76 +150,232 @@ def inner_kernel(
         # KDA reshapes these per (head, channel) rather than padding out to
         # a lane multiple over heads.
         a_log = weights_ref.gdn.a_log[...]
-        dt_bias = weights_ref.gdn.dt_bias[...]
+        dt_bias = (
+            weights_ref.gdn.dt_bias[...]
+            if (cfg.use_dt_bias and weights_ref.gdn.dt_bias is not None)
+            else None
+        )
     else:
         padding_size = cfg.aligned_num_v_heads - cfg.num_v_heads
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
-        dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+        dt_bias = (
+            jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
+            if (cfg.use_dt_bias and weights_ref.gdn.dt_bias is not None)
+            else None
+        )
 
-    # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
-    # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
-    # Passing refs into gdn.py breaks strict separation of concerns.
+    out = None
+    new_recurrent_state = None
+
     if cfg.use_recurrent:
-        recurrent_fn = (
-            compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
-        )
-        q_compact, k_compact, v_compact, b_compact, a_compact = (
-            vmem_ldst.load_activation_as_compact(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
+        with jax.named_scope("gdn_stage2_recurrent_decode"):
+            prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
+                metadata_ref=metadata_ref,
+                p_id=p_id,
+                recurrent_in_slot_ref=recurrent_in_slot_ref,
+                carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+                cfg=cfg,
+                upcast_f32=True,
+            )
+            recurrent_fn = (
+                compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
+            )
+            q_compact, k_compact, v_compact, b_compact, a_compact = (
+                vmem_ldst.load_as_qkv_compact(
+                    qkv_vreg=qkv_out_compact,
+                    qkv_vmem_ref=qkv_slot_ref,
+                    b_vmem_ref=b_slot_ref,
+                    a_vmem_ref=a_slot_ref,
+                    cfgs=cfg,
+                )
+            )
+
+            out, new_recurrent_state = recurrent_fn(
+                q_compact=q_compact,
+                k_compact=k_compact,
+                v_compact=v_compact,
+                b_compact=b_compact,
+                a_compact=a_compact,
+                state_prev=prev_recurrent,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                cfg=cfg,
+                real_sizes=real_sizes,
+            )
+    elif stream_io and not cfg.is_kda:
+        with jax.named_scope("gdn_stage2_chunked_prefill_stream"):
+            del qkv_out_compact
+            b_large, a_large = vmem_ldst.load_ba_as_large(
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
             )
-        )
-
-        out, new_recurrent_state = recurrent_fn(
-            q_compact=q_compact,
-            k_compact=k_compact,
-            v_compact=v_compact,
-            b_compact=b_compact,
-            a_compact=a_compact,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
-
+            rec0 = metadata_ref.get_record(p_id, 0)
+            has_init = metadata_ref.s_idx_has_initial_state[rec0.s_idx]
+            out, new_recurrent_state = compute_gdn.chunked_gdn_stream(
+                real_sizes=real_sizes,
+                qkv_vmem_ref=qkv_slot_ref,
+                b_large=b_large,
+                a_large=a_large,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                recurrent_in_slot_ref=recurrent_in_slot_ref,
+                carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+                is_first_tile=rec0.is_first_tile,
+                has_initial_state=has_init,
+                out_slot_ref=(out_slot_ref if use_fout else None),
+                state_out_ref=(carry_recurrent_scratch_ref if use_fstate else None),
+                cfg=cfg,
+            )
     else:
-        chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
-        q_large, k_large, v_large, b_large, a_large = (
-            vmem_ldst.load_activation_as_large(
-                qkv_vreg=qkv_out_compact,
+        with jax.named_scope("gdn_stage2_chunked_prefill"):
+            chunked_fn = (
+                compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
+            )
+            del qkv_out_compact
+            q_large, k_large, v_large, b_large, a_large = vmem_ldst.load_as_qkv_large(
+                qkv_vreg=None,
                 qkv_vmem_ref=qkv_slot_ref,
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfgs=cfg,
             )
-        )
+            prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
+                metadata_ref=metadata_ref,
+                p_id=p_id,
+                recurrent_in_slot_ref=recurrent_in_slot_ref,
+                carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+                cfg=cfg,
+                upcast_f32=not compute_gdn._hc_active(cfg),
+            )
+            if qpad_scratch_ref is not None and not cfg.is_kda:
+                with jax.named_scope("gdn_stage2_chunked_prefill_qpad"):
+                    q_large, k_large, v_large, gating_log, beta = (
+                        compute_gdn.chunked_gdn_prepare(
+                            real_sizes=real_sizes,
+                            q_large=q_large,
+                            k_large=k_large,
+                            v_large=v_large,
+                            b_large=b_large,
+                            a_large=a_large,
+                            a_log=a_log,
+                            dt_bias=dt_bias,
+                            cfg=cfg,
+                        )
+                    )
+                    qpad_scratch_ref[...] = jnp.zeros_like(qpad_scratch_ref[...])
+                    q_zeros = qpad_scratch_ref[...]
+                    opts = compute_gdn._hc_options(cfg)
+                    assert opts is not None
+                    gating_log2 = gating_log[0] * compute_gdn._LOG2E
+                    g_cum_list = [gating_log2[:, :1]]
+                    for row in range(1, cfg.chunk_size):
+                        g_cum_list.append(
+                            g_cum_list[-1] + gating_log2[:, row : row + 1]
+                        )
+                    g_cum_log2_compact = jnp.concat(g_cum_list, axis=1)
+                    v_per_kq = cfg.v_per_kq_head
+                    outs = []
+                    states = []
+                    for h in range(cfg.num_kq_heads):
+                        vs = slice(h * v_per_kq, (h + 1) * v_per_kq)
+                        ks = slice(h, h + 1)
+                        g_cum_h = compute_gdn.fused_transpose_broadcast(
+                            g_cum_log2_compact[:, :, vs], src_dim=2, dst_dim=0
+                        )[:v_per_kq]
+                        beta_h = compute_gdn.fused_transpose_broadcast(
+                            beta[0, :, :, vs], src_dim=2, dst_dim=0
+                        )[:v_per_kq]
+                        k_h = k_large[0, ks]
+                        q_h = q_large[0, ks]
+                        k_pad = jnp.concatenate([k_h, q_zeros[None]], axis=1)
+                        qk_cat = jnp.concatenate([k_h, q_h], axis=1)
+                        qk_kt = jax.lax.dot(
+                            qk_cat.astype(jnp.bfloat16),
+                            k_pad.astype(jnp.bfloat16),
+                            dimension_numbers=(((2,), (2,)), ((0,), (0,))),
+                            preferred_element_type=jnp.float32,
+                        )
+                        c = cfg.chunk_size
+                        hc = compute_gdn._HcChunk(
+                            q_h,
+                            k_h,
+                            v_large[0, vs],
+                            g_cum_h,
+                            beta_h,
+                            prev_recurrent[0, vs],
+                            cfg,
+                            opts,
+                        )
+                        hc.prepare()
+                        hc.k_k_t = qk_kt[:, :c, :c]
+                        hc.q_k_t = qk_kt[:, c:, :c]
+                        kq_s_val = jnp.float32(1.0 / opts.kq_fixed_scale)
+                        kq_inv_s = jnp.float32(opts.kq_fixed_scale)
+                        hc.k_hi = (k_h.astype(jnp.float32) * kq_inv_s).astype(
+                            hc.mxu_dtype
+                        )
+                        hc.q_hi = (q_h.astype(jnp.float32) * kq_inv_s).astype(
+                            hc.mxu_dtype
+                        )
+                        hc.k_lo = jnp.zeros_like(hc.k_hi)
+                        hc.q_lo = jnp.zeros_like(hc.q_hi)
+                        hc.k_s = kq_s_val
+                        hc.q_s = kq_s_val
+                        hc.base_invert()
+                        hc.double_blocks()
+                        hc.state_vscale()
+                        hc.kq_proj()
+                        hc.v_diff_scale()
+                        hc.solve_tail()
+                        o_h, s_h = hc.out_state()
+                        outs.append(o_h)
+                        states.append(s_h)
+                    out = jnp.expand_dims(
+                        jnp.concatenate(outs, axis=0).swapaxes(0, 1), 0
+                    )
+                    new_recurrent_state = jnp.expand_dims(
+                        jnp.expand_dims(jnp.concatenate(states, axis=0), 0), 0
+                    )
+            else:
+                out, new_recurrent_state = chunked_fn(
+                    q_large=q_large,
+                    k_large=k_large,
+                    v_large=v_large,
+                    b_large=b_large,
+                    a_large=a_large,
+                    state_prev=prev_recurrent,
+                    a_log=a_log,
+                    dt_bias=dt_bias,
+                    cfg=cfg,
+                    real_sizes=real_sizes,
+                )
 
-        out, new_recurrent_state = chunked_fn(
-            q_large=q_large,
-            k_large=k_large,
-            v_large=v_large,
-            b_large=b_large,
-            a_large=a_large,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
+    with jax.named_scope("gdn_stage3_store_out_and_state"):
+        if out is not None:
+            out_slot_ref[...] = out.astype(out_slot_ref.dtype)
+        if use_fstate:
+            assert carry_recurrent_scratch_ref is not None
+            rec0 = metadata_ref.get_record(p_id, 0)
+            should_flush = rec0.is_last_tile
+            if metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+                should_flush = jnp.logical_or(
+                    should_flush, metadata_ref.is_prefill_ckpt_tile(p_id, 0)
+                )
 
-    # Store output and recurrent to vmem.
-    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    # Round to the state dtype, then pack into the uint32 window.
-    recurrent_out_slot_ref[...] = pltpu.bitcast(
-        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
-    )
-
-    if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+            @pl.when(jnp.logical_and(should_flush, rec0.r_size > 0))
+            def _flush_recurrent_out():
+                recurrent_out_slot_ref[0, 0] = pltpu.bitcast(
+                    carry_recurrent_scratch_ref[0].astype(cfg.dtypes.recurrent_state),
+                    jnp.uint32,
+                )
+        else:
+            assert new_recurrent_state is not None
+            recurrent_out_slot_ref[...] = pltpu.bitcast(
+                new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+            )
+            if carry_recurrent_scratch_ref is not None:
+                carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def outer_kernel(
@@ -223,6 +393,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    qpad_scratch_ref: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -266,6 +437,7 @@ def outer_kernel(
         weights_ref,
         carry_conv_scratch_ref,
         carry_recurrent_scratch_ref,
+        qpad_scratch_ref,
     )
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
@@ -329,6 +501,8 @@ def outer_kernel(
         "gate_lower_bound",
         "kernel_act_dtype",
         "kernel_conv_weight_dtype",
+        "gdn_mxu_operand_dtype",
+        "gdn_mxu_fp8_mode",
     ),
 )
 def fused_conv1d_gdn(
@@ -365,6 +539,8 @@ def fused_conv1d_gdn(
     compute_precision: jnp.dtype = jnp.float32.dtype,
     kernel_act_dtype: jnp.dtype = jnp.float32.dtype,
     kernel_conv_weight_dtype: jnp.dtype = jnp.float32.dtype,
+    gdn_mxu_operand_dtype: jnp.dtype | str | None = None,
+    gdn_mxu_fp8_mode: str | None = None,
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
@@ -647,6 +823,17 @@ def fused_conv1d_gdn(
     vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+    if gdn_mxu_operand_dtype is None and envs.TPU_GDN_MXU_OPERAND_DTYPE:
+        resolved_mxu_dtype: jnp.dtype | None = jnp.dtype(envs.TPU_GDN_MXU_OPERAND_DTYPE)
+    elif gdn_mxu_operand_dtype is not None:
+        resolved_mxu_dtype = jnp.dtype(gdn_mxu_operand_dtype)
+    else:
+        resolved_mxu_dtype = None
+    resolved_fp8_mode = (
+        gdn_mxu_fp8_mode
+        if gdn_mxu_fp8_mode is not None
+        else (envs.TPU_GDN_MXU_FP8_MODE or "unscaled")
+    )
 
     def call_kernel(
         in_states: jax.Array | tuple[jax.Array, jax.Array],
@@ -682,6 +869,8 @@ def fused_conv1d_gdn(
                 conv_state=conv_dtype,
             ),
             is_shared=is_shared,
+            gdn_mxu_operand_dtype=resolved_mxu_dtype,
+            gdn_mxu_fp8_mode=resolved_fp8_mode,
         )
 
         # Step 6: Metadata preprocessing. Will be executed multiple times per-layer
@@ -713,6 +902,12 @@ def fused_conv1d_gdn(
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
         scratch_shapes = cfg.get_scratch_shape_dict()
+        qpad_shape = (
+            compute_gdn.hc_qpad_shape(cfg) if mode == config.GDNMode.PER_SEQ else None
+        )
+        scratch_shapes["qpad_scratch_ref"] = (
+            pltpu.VMEM(qpad_shape, jnp.bfloat16) if qpad_shape is not None else None
+        )
 
         # Step 7: Handle case where write needs to be done in existing out.
         input_output_aliases = {}

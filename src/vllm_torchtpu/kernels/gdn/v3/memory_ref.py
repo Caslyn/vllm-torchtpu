@@ -73,6 +73,18 @@ class SmemWrapper:
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
+class TileRecord:
+    """Per-tile scheduling metadata loaded from SMEM."""
+
+    s_idx: jax.Array
+    r_base: jax.Array
+    r_size: jax.Array
+    is_first_tile: jax.Array
+    is_last_tile: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
 class MetadataRef:
     num_tiles: Any
     p_id_to_s_idx: SmemWrapper
@@ -100,6 +112,15 @@ class MetadataRef:
     # block s_idx_to_prefill_ckpt_index[s].
     s_idx_to_prefill_ckpt_row: Any = None
     s_idx_to_prefill_ckpt_index: Any = None
+
+    def get_record(self, p_id: int | jax.Array, idx: int) -> TileRecord:
+        return TileRecord(
+            s_idx=self.p_id_to_s_idx[p_id, idx],
+            r_base=self.p_id_to_r_base[p_id, idx],
+            r_size=self.p_id_to_r_size[p_id, idx],
+            is_first_tile=self.p_id_is_first_tile[p_id, idx],
+            is_last_tile=self.p_id_is_last_tile[p_id, idx],
+        )
 
     @classmethod
     def create(

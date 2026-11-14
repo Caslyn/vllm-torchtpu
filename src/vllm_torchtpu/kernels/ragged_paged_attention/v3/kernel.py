@@ -474,66 +474,68 @@ def _ragged_paged_attention_kernel_loop(
         assert k.dtype == v.dtype
 
         # Follow FlashAttention-2 forward pass.
-        if q_scale is not None:
-            q = q / q_scale
-            if jnp.issubdtype(k.dtype, jnp.floating):
-                dtype_info = jnp.finfo(k.dtype)
-                minval = float(dtype_info.min)
-                maxval = float(dtype_info.max)
-                q = jnp.clip(q, min=minval, max=maxval)
-            q = q.astype(k.dtype)
+        with jax.named_scope("rpa_step1_qk_matmul"):
+            if q_scale is not None:
+                q = q / q_scale
+                if jnp.issubdtype(k.dtype, jnp.floating):
+                    dtype_info = jnp.finfo(k.dtype)
+                    minval = float(dtype_info.min)
+                    maxval = float(dtype_info.max)
+                    q = jnp.clip(q, min=minval, max=maxval)
+                q = q.astype(k.dtype)
 
-        s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32).astype(out_dtype)
-        s *= sm_scale
-        if k_scale is not None:
-            s *= k_scale
-        if q_scale is not None:
-            s *= q_scale
-        if soft_cap is not None:
-            s = soft_cap * jnp.tanh(s / soft_cap)
+            s = jnp.matmul(q, k.T, preferred_element_type=jnp.float32).astype(out_dtype)
+            s *= sm_scale
+            if k_scale is not None:
+                s *= k_scale
+            if q_scale is not None:
+                s *= q_scale
+            if soft_cap is not None:
+                s = soft_cap * jnp.tanh(s / soft_cap)
 
-        max_kv_len = pages_per_seq * page_size
-        int_ty = jnp.int32
-        if (
-            get_dtype_packing(q_dtype) != 1
-            and get_tpu_version() >= 6
-            and max_kv_len <= jnp.iinfo(jnp.int16).max
-        ):
-            int_ty = jnp.int16
-        processed_q_len_int = processed_q_len.astype(int_ty)
-        processed_kv_len_int = processed_kv_len.astype(int_ty)
-        effective_kv_len_int = effective_kv_len.astype(int_ty)
-        q_span = processed_q_len_int + (
-            lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
-        ).astype(int_ty)
-        k_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, s.shape, 1)
-        v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
+        with jax.named_scope("rpa_step1_causal_mask_and_online_softmax"):
+            max_kv_len = pages_per_seq * page_size
+            int_ty = jnp.int32
+            if (
+                get_dtype_packing(q_dtype) != 1
+                and get_tpu_version() >= 6
+                and max_kv_len <= jnp.iinfo(jnp.int16).max
+            ):
+                int_ty = jnp.int16
+            processed_q_len_int = processed_q_len.astype(int_ty)
+            processed_kv_len_int = processed_kv_len.astype(int_ty)
+            effective_kv_len_int = effective_kv_len.astype(int_ty)
+            q_span = processed_q_len_int + (
+                lax.broadcasted_iota(jnp.int32, s.shape, 0) // num_q_heads_per_kv_head
+            ).astype(int_ty)
+            k_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, s.shape, 1)
+            v_span = processed_kv_len_int + lax.broadcasted_iota(int_ty, v.shape, 0)
 
-        mask = None
-        if use_causal_mask:
-            assert not skip_kv_mask
-            mask = mask_and(mask, q_span >= k_span)
+            mask = None
+            if use_causal_mask:
+                assert not skip_kv_mask
+                mask = mask_and(mask, q_span >= k_span)
 
-        if not skip_kv_mask:
-            mask = mask_and(mask, k_span < effective_kv_len_int)
-            v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
+            if not skip_kv_mask:
+                mask = mask_and(mask, k_span < effective_kv_len_int)
+                v = jnp.where(v_span < effective_kv_len_int, v, 0.0)
 
-        if sliding_window is not None:
-            mask = mask_and(mask, q_span < k_span + sliding_window)
+            if sliding_window is not None:
+                mask = mask_and(mask, q_span < k_span + sliding_window)
 
-        if mask is not None:
-            s = jnp.where(mask, s, cast(float, mask_value))
+            if mask is not None:
+                s = jnp.where(mask, s, cast(float, mask_value))
 
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
-        m_prev = m_ref[...]
-        m_curr = jnp.maximum(m_prev, s_rowmax)
-        m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+            s_rowmax = jnp.max(s, axis=1, keepdims=True)
+            m_prev = m_ref[...]
+            m_curr = jnp.maximum(m_prev, s_rowmax)
+            m_ref[...] = m_curr
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
 
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = l_ref[...]
-        l_ref[...] = exp_m_diff * l_prev + p_rowsum
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
+            exp_m_diff = jnp.exp(m_prev - m_curr)
+            l_prev = l_ref[...]
+            l_ref[...] = exp_m_diff * l_prev + p_rowsum
 
         return p, v, exp_m_diff
 
@@ -550,11 +552,12 @@ def _ragged_paged_attention_kernel_loop(
         assert v.shape == (bkv_csz, head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
-        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32).astype(out_dtype)
-        if v_scale is not None:
-            pv *= v_scale
-        o_prev = o_ref[...]
-        o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
+        with jax.named_scope("rpa_step2_pv_matmul_and_accum"):
+            pv = jnp.matmul(p, v, preferred_element_type=jnp.float32).astype(out_dtype)
+            if v_scale is not None:
+                pv *= v_scale
+            o_prev = o_ref[...]
+            o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
 
     def _async_copy(src, dst, sem, wait):
         if debug_mode:
@@ -975,24 +978,28 @@ def _ragged_paged_attention_kernel_loop(
                 processed_kv_len = bkv_idx * bkv_sz
 
                 # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+                with jax.named_scope("rpa_bkv_dma_prefetch_and_wait"):
 
-                # Wait for cur bq if not ready yet
-                @pl.when(bkv_idx == start_bkv_idx)
-                def wait_cur_bq():
-                    wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
 
-                # Wait for cur bkv
-                offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+                    # Wait for cur bq if not ready yet
+                    @pl.when(bkv_idx == start_bkv_idx)
+                    def wait_cur_bq():
+                        wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+
+                    # Wait for cur bkv
+                    offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
-                @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                def update_cur_bkv_to_cache():
-                    start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+                with jax.named_scope("rpa_kv_cache_writeback_dma"):
+
+                    @pl.when(jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
                 debug_print("[RPA debug] -----------flash attention-----------")
                 debug_print("[RPA debug] seq_idx={}", seq_idx)
@@ -1020,15 +1027,16 @@ def _ragged_paged_attention_kernel_loop(
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                         for kv_head_idx in range(actual_num_kv_heads):
-                            bk_c, bv_c = load_bkv(
-                                bkv_sem_idx,
-                                kv_head_idx,
-                                bkv_start,
-                                bkv_csz,
-                            )
-                            bq_c = load_bq(
-                                bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
-                            )
+                            with jax.named_scope("rpa_load_bq_bkv_vmem"):
+                                bk_c, bv_c = load_bkv(
+                                    bkv_sem_idx,
+                                    kv_head_idx,
+                                    bkv_start,
+                                    bkv_csz,
+                                )
+                                bq_c = load_bq(
+                                    bq_sem_idx, kv_head_idx, bq_start, actual_bq_csz
+                                )
 
                             lm_slice_start = bq_start * num_q_heads_per_kv_head
                             lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
@@ -1077,33 +1085,36 @@ def _ragged_paged_attention_kernel_loop(
                     )
 
             # Load acc and calculate final output.
-            acc = acc_ref[...]
-            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
-            out = (
-                acc * pl.reciprocal(l, approx=True)
-                if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
-                else lax.div(acc, l)
-            ).astype(out_dtype)
+            with jax.named_scope("rpa_output_normalize_and_send_bo"):
+                acc = acc_ref[...]
+                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+                out = (
+                    acc * pl.reciprocal(l, approx=True)
+                    if (l.dtype == jnp.float32 and out_dtype != jnp.float32)
+                    else lax.div(acc, l)
+                ).astype(out_dtype)
 
-            # Wait for previous bo to be fully sent before storing new bo.
-            bo_sem_idx = sem_ids_ref[2]
-            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
-            wait_send_bo(bo_sem_idx)
+                # Wait for previous bo to be fully sent before storing new bo.
+                bo_sem_idx = sem_ids_ref[2]
+                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+                wait_send_bo(bo_sem_idx)
 
-            # Store output from acc to bo.
-            out_ref = (
-                bo_x2_ref.at[bo_sem_idx]
-                .bitcast(jnp.int32)
-                .reshape(
-                    actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head_per_packing,
-                    head_dim,
+                # Store output from acc to bo.
+                out_ref = (
+                    bo_x2_ref.at[bo_sem_idx]
+                    .bitcast(jnp.int32)
+                    .reshape(
+                        actual_num_kv_heads
+                        * bq_sz
+                        * num_q_heads_per_kv_head_per_packing,
+                        head_dim,
+                    )
                 )
-            )
-            out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-            strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+                out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+                strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
-            # Send cur bo
-            start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+                # Send cur bo
+                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
     ### ------- Kernel start ------- ###
 
