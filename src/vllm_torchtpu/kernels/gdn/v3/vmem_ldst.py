@@ -245,7 +245,7 @@ def load_and_select_recurrent_state(
 
 
 def load_as_qkv_compact(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
@@ -259,7 +259,7 @@ def load_as_qkv_compact(
 
 
 def load_as_qkv_large(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
@@ -320,7 +320,7 @@ def load_qkv_col(
 
 
 def load_activation_as_compact(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
@@ -328,7 +328,8 @@ def load_activation_as_compact(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a compact layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+    if qkv_vreg is not None:
+        qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
     k_offset = cfgs.num_kq_heads * cfgs.kq_head_dim
     v_offset = 2 * k_offset
@@ -351,7 +352,7 @@ def load_activation_as_compact(
 
 
 def load_activation_as_large(
-    qkv_vreg: jax.Array,
+    qkv_vreg: jax.Array | None,
     qkv_vmem_ref: jax.Ref,
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
@@ -359,7 +360,8 @@ def load_activation_as_large(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Load activations from VMEM as a large layout."""
 
-    qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
+    if qkv_vreg is not None:
+        qkv_vmem_ref[...] = qkv_vreg.astype(qkv_vmem_ref.dtype)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     kq_lanes = cfgs.num_kq_heads * (cfgs.kq_head_dim // num_lanes)
