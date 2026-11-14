@@ -1594,7 +1594,6 @@ class _HcChunk:
                             cs_map[v] = cs_stack
                         cs_l = self.limbs(cs_stack, "l")
                     if b < 32:
-                        assert rhs_mask is not None
                         if z_bf16_b is not None:
                             tile32_bf16 = jnp.concat(
                                 [d_v.astype(jnp.bfloat16), z_bf16_b], axis=0
@@ -1620,7 +1619,11 @@ class _HcChunk:
                         rhs_even = []
                         for dl in d_l:
                             rep = jnp.concat([dl] * (chunk // 32), axis=0)
-                            rhs_even.append(_hc_bitmask_zero(rep, rhs_mask, rhs_umask))
+                            rhs_even.append(
+                                rep
+                                if rhs_mask is None
+                                else _hc_bitmask_zero(rep, rhs_mask, rhs_umask)
+                            )
                         dl_map[v] = d_l
                     else:
                         d_l = self.limbs(d_v, "m")
