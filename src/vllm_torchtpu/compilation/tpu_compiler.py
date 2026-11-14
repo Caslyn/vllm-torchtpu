@@ -874,6 +874,24 @@ class TpuCompilerAdaptor(CompilerInterface):
             key is not None and self.cache_dir is not None and not self._disable_cache
         )
 
+        if caching:
+            assert key is not None and self.cache_dir is not None
+            own_path = os.path.join(self.cache_dir, key)
+            if os.path.exists(own_path):
+                compiled_fn = self._replay(own_path, graph, was_wrapped)
+                if compiled_fn is not None:
+                    logger.info(
+                        "[TpuCompilerAdaptor] Replayed range %s from own %s",
+                        compile_range,
+                        own_path,
+                    )
+                    handle = (key, own_path, was_wrapped)
+                    if was_wrapped:
+                        compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+                    if size is not None:
+                        shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+                    return compiled_fn, handle
+
         # Another rank of this host compiled, or is compiling, this bucket:
         # replay its artifact instead of tracing, lowering and compiling it
         # again. The artifact is the one vLLM's compile cache already holds for
@@ -957,6 +975,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         # executable for it (see shape_variants.BucketExecutables).
         if key is not None and size is not None:
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+        import ctypes
+        import gc
+
+        gc.collect()
+        with contextlib.suppress(Exception):
+            ctypes.CDLL(None).malloc_trim(0)
         return compiled_fn, handle
 
     def load(
