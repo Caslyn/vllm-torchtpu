@@ -275,12 +275,12 @@ def load_as_qkv_large(
 def load_ba_as_large(
     b_vmem_ref: jax.Ref,
     a_vmem_ref: jax.Ref,
-    cfgs: config.GDNConfig,
+    cfgs: config.GDNConfig | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Load only b and a from VMEM in the large layout (leaving qkv in VMEM)."""
+    """Loads `[seq, 1, chunk, aligned_num_v_heads]` gate inputs without `qkv`."""
     with jax.named_scope("gdn_unpack_ba_large"):
         b_large = jnp.expand_dims(load_compact_to_large(b_vmem_ref), axis=1)
-        if cfgs.is_kda:
+        if cfgs is not None and cfgs.is_kda:
             a_large_list = [
                 load_strided_heads(
                     a_vmem_ref.at[idx], cfgs.num_v_heads, cfgs.kq_head_dim
@@ -294,29 +294,26 @@ def load_ba_as_large(
 
 
 def qkv_head_cols(
-    cfgs: config.GDNConfig,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Return 128-lane column indices in qkv_vmem_ref for each q, k, and v head."""
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    assert cfgs.kq_head_dim == num_lanes
-    assert cfgs.v_head_dim == num_lanes
-    nq = cfgs.num_kq_heads
-    nv = cfgs.num_v_heads
-    q_cols = tuple(range(nq))
-    k_cols = tuple(nq + h for h in range(nq))
-    v_cols = tuple(2 * nq + h for h in range(nv))
-    return q_cols, k_cols, v_cols
+    kind: str, head: int, cfgs: config.GDNConfig, num_lanes: int
+) -> list[int]:
+    """128-lane column indices inside fused `qkv` for `(kind, head)`."""
+    kq_cols = cfgs.kq_head_dim // num_lanes
+    if kind == "q":
+        base = head * kq_cols
+        return list(range(base, base + kq_cols))
+    if kind == "k":
+        base = (cfgs.num_kq_heads + head) * kq_cols
+        return list(range(base, base + kq_cols))
+    v_cols = cfgs.v_head_dim // num_lanes
+    base = 2 * cfgs.num_kq_heads * kq_cols + head * v_cols
+    return list(range(base, base + v_cols))
 
 
-def load_qkv_col(
-    qkv_vmem_ref: jax.Ref, col: int, row_stop: int | None = None
-) -> jax.Array:
-    """Load one 128-wide head column `[chunk_size, 128]` for seq 0 from qkv_vmem_ref."""
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    start = col * num_lanes
-    if row_stop is None:
-        return qkv_vmem_ref[0, :, 0, start : start + num_lanes]
-    return qkv_vmem_ref[0, :row_stop, 0, start : start + num_lanes]
+def load_qkv_col(qkv_seq_ref: jax.Ref, col: int, num_lanes: int) -> jax.Array:
+    """Strided VMEM load of one `[rows, num_lanes]` column from a compact ref."""
+    lanes_per_col = qkv_seq_ref.shape[-1] // num_lanes
+    flat_ref = qkv_seq_ref.reshape(-1, num_lanes)
+    return flat_ref[col::lanes_per_col].astype(jnp.float32)
 
 
 def load_activation_as_compact(
